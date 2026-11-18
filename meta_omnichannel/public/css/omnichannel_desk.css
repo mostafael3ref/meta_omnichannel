@@ -1,0 +1,5 @@
+/* Desk helpers for Omnichannel */
+.omnichannel-settings-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+}

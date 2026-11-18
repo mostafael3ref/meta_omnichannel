@@ -1,0 +1,274 @@
+:root {
+  --oc-bg: #f3f5f7;
+  --oc-panel: #ffffff;
+  --oc-ink: #142033;
+  --oc-muted: #5b6b7c;
+  --oc-line: #e4e9ef;
+  --oc-accent: #0f6e56;
+  --oc-accent-soft: #e7f6f1;
+  --oc-danger: #b42318;
+  --oc-inbound: #eef2f6;
+  --oc-outbound: #d9f2ea;
+  --oc-sidebar: #10233f;
+  --oc-sidebar-ink: #dce7f5;
+  --oc-radius: 14px;
+  --oc-font: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#omnichannel-app,
+.oc-shell {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--oc-font);
+  color: var(--oc-ink);
+  background: var(--oc-bg);
+}
+
+.oc-shell {
+  display: grid;
+  grid-template-columns: 220px minmax(280px, 360px) 1fr 300px;
+  min-height: 100vh;
+  background: linear-gradient(160deg, #edf2f7 0%, #f7fafc 45%, #eef6f3 100%);
+}
+
+.oc-side,
+.oc-list,
+.oc-chat,
+.oc-customer {
+  background: var(--oc-panel);
+  border-inline-end: 1px solid var(--oc-line);
+  min-height: 100vh;
+}
+
+.oc-side {
+  background: var(--oc-sidebar);
+  color: var(--oc-sidebar-ink);
+  padding: 1.25rem 0.85rem;
+}
+
+.oc-brand {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin: 0 0 1.25rem;
+}
+
+.oc-nav button {
+  width: 100%;
+  text-align: start;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0.65rem 0.75rem;
+  border-radius: 10px;
+  cursor: pointer;
+  margin-bottom: 0.25rem;
+}
+
+.oc-nav button.active,
+.oc-nav button:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.oc-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.oc-list-toolbar {
+  padding: 1rem;
+  border-bottom: 1px solid var(--oc-line);
+  display: grid;
+  gap: 0.6rem;
+}
+
+.oc-list-toolbar input,
+.oc-composer textarea,
+.oc-customer input,
+.oc-customer select,
+.oc-customer textarea {
+  width: 100%;
+  border: 1px solid var(--oc-line);
+  border-radius: 10px;
+  padding: 0.65rem 0.75rem;
+  font: inherit;
+}
+
+.oc-btn {
+  border: 0;
+  border-radius: 10px;
+  padding: 0.55rem 0.9rem;
+  background: var(--oc-accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.oc-btn.secondary {
+  background: var(--oc-accent-soft);
+  color: var(--oc-accent);
+}
+
+.oc-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.oc-conv {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: start;
+  padding: 0.9rem 1rem;
+  border-bottom: 1px solid var(--oc-line);
+  cursor: pointer;
+}
+
+.oc-conv.active {
+  background: #f4fbf8;
+}
+
+.oc-conv-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-weight: 600;
+}
+
+.oc-preview {
+  color: var(--oc-muted);
+  font-size: 0.9rem;
+  margin-top: 0.25rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.oc-badge {
+  display: inline-flex;
+  min-width: 1.25rem;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--oc-accent);
+  color: #fff;
+  font-size: 0.75rem;
+  padding: 0 0.35rem;
+}
+
+.oc-chat {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.oc-chat-header {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--oc-line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.oc-messages {
+  padding: 1.25rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.oc-bubble {
+  max-width: min(72%, 520px);
+  padding: 0.75rem 0.9rem;
+  border-radius: 16px;
+  line-height: 1.45;
+}
+
+.oc-bubble.inbound {
+  align-self: flex-start;
+  background: var(--oc-inbound);
+}
+
+.oc-bubble.outbound {
+  align-self: flex-end;
+  background: var(--oc-outbound);
+}
+
+.oc-meta {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--oc-muted);
+}
+
+.oc-composer {
+  border-top: 1px solid var(--oc-line);
+  padding: 0.9rem 1rem;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.75rem;
+  align-items: end;
+}
+
+.oc-customer {
+  padding: 1rem;
+  border-inline-end: 0;
+}
+
+.oc-customer h3 {
+  margin: 0 0 0.75rem;
+}
+
+.oc-customer section {
+  margin-bottom: 1.25rem;
+}
+
+.oc-empty,
+.oc-error,
+.oc-boot {
+  padding: 2rem 1rem;
+  color: var(--oc-muted);
+  text-align: center;
+}
+
+.oc-error {
+  color: var(--oc-danger);
+}
+
+.channel-pill {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--oc-muted);
+}
+
+@media (max-width: 1100px) {
+  .oc-shell {
+    grid-template-columns: 72px minmax(240px, 1fr) 1.2fr;
+  }
+  .oc-customer {
+    display: none;
+  }
+  .oc-brand span {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .oc-shell {
+    grid-template-columns: 1fr;
+  }
+  .oc-side,
+  .oc-list,
+  .oc-chat {
+    min-height: auto;
+  }
+}

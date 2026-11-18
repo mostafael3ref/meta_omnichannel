@@ -1,0 +1,192 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-04-12 14:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "conversation",
+  "channel",
+  "provider",
+  "direction",
+  "message_type",
+  "content",
+  "text_content",
+  "external_message_id",
+  "idempotency_key",
+  "delivery_status",
+  "sent_at",
+  "sender_external_id",
+  "attachment_url",
+  "attachment_mime",
+  "raw_payload_hash",
+  "error_summary",
+  "is_internal_note"
+ ],
+ "fields": [
+  {
+   "fieldname": "conversation",
+   "fieldtype": "Link",
+   "label": "Conversation",
+   "options": "Omnichannel Conversation",
+   "reqd": 1,
+   "in_list_view": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "channel",
+   "fieldtype": "Link",
+   "label": "Channel",
+   "options": "Omnichannel Channel",
+   "reqd": 1
+  },
+  {
+   "fieldname": "provider",
+   "fieldtype": "Select",
+   "label": "Provider",
+   "options": "Facebook\nInstagram\nWhatsApp",
+   "reqd": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "direction",
+   "fieldtype": "Select",
+   "label": "Direction",
+   "options": "Inbound\nOutbound",
+   "reqd": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "message_type",
+   "fieldtype": "Select",
+   "label": "Message Type",
+   "options": "Text\nImage\nAudio\nVideo\nFile\nTemplate\nSystem\nUnknown",
+   "default": "Text",
+   "reqd": 1
+  },
+  {
+   "fieldname": "content",
+   "fieldtype": "Text Editor",
+   "label": "Content"
+  },
+  {
+   "fieldname": "text_content",
+   "fieldtype": "Long Text",
+   "label": "Text Content"
+  },
+  {
+   "fieldname": "external_message_id",
+   "fieldtype": "Data",
+   "label": "External Message ID",
+   "unique": 1
+  },
+  {
+   "fieldname": "idempotency_key",
+   "fieldtype": "Data",
+   "label": "Idempotency Key",
+   "unique": 1
+  },
+  {
+   "fieldname": "delivery_status",
+   "fieldtype": "Select",
+   "label": "Delivery Status",
+   "options": "Pending\nQueued\nSent\nDelivered\nRead\nFailed\nUnknown",
+   "default": "Unknown",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "sent_at",
+   "fieldtype": "Datetime",
+   "label": "Sent At",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "sender_external_id",
+   "fieldtype": "Data",
+   "label": "Sender External ID"
+  },
+  {
+   "fieldname": "attachment_url",
+   "fieldtype": "Data",
+   "label": "Attachment URL",
+   "description": "Connector-hosted or public media URL metadata only"
+  },
+  {
+   "fieldname": "attachment_mime",
+   "fieldtype": "Data",
+   "label": "Attachment MIME"
+  },
+  {
+   "fieldname": "raw_payload_hash",
+   "fieldtype": "Data",
+   "label": "Payload Hash",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error_summary",
+   "fieldtype": "Small Text",
+   "label": "Error Summary",
+   "read_only": 1
+  },
+  {
+   "fieldname": "is_internal_note",
+   "fieldtype": "Check",
+   "label": "Internal Note",
+   "default": 0
+  }
+ ],
+ "issingle": 0,
+ "links": [],
+ "modified": "2026-04-12 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Meta Omnichannel",
+ "name": "Omnichannel Message",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "Omnichannel Administrator",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "Omnichannel Agent",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1,
+ "index_web_pages_for_search": 0,
+ "title_field": "text_content",
+ "search_fields": "external_message_id,idempotency_key,text_content"
+}

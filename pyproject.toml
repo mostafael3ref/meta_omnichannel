@@ -1,0 +1,33 @@
+[project]
+name = "meta_omnichannel"
+authors = [
+    { name = "Meta Omnichannel", email = "dev@meta-omnichannel.local" }
+]
+description = "Meta Omnichannel CRM — Facebook Messenger, Instagram, and WhatsApp integration for Frappe CRM"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    # Frappe / crm are installed and managed by Bench — do not pin them here.
+    "requests>=2.28.0",
+]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "meta_omnichannel"
+
+# Declared for Bench dependency validation (see bench.app.App.validate_app_dependencies).
+# Target stack for this commercial app: Frappe Framework v15.
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0,<16.0.0"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B"]
+ignore = ["E501"]

@@ -1,0 +1,77 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Node (if frontend assets are added later)
+node_modules/
+*.log
+npm-debug.log*
+
+# Frappe / Bench local artifacts (should not appear in this source repo)
+sites/
+archived/
+config/
+logs/
+env/
+Procfile
+pids/
+redis_*.conf
+common_site_config.json
+
+# Secrets — never commit credentials
+*.pem
+*.key
+.env.*
+!.env.example
+*.sqlite*
+*.db
+credentials.json
+secrets.json
+site_config.json
+
+# Internal review artifacts (keep local; do not publish)
+docs/CONNECTOR_COMPATIBILITY_REPORT.md

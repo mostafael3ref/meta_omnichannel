@@ -1,0 +1,14 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ _("Omnichannel Inbox") }}{% endblock %}
+
+{% block page_content %}
+<div id="omnichannel-app" class="omnichannel-root" dir="auto">
+  <div class="omnichannel-boot">{{ _("Loading Omnichannel Inbox…") }}</div>
+</div>
+<script>
+  window.__OMNICHANNEL_BOOT__ = {{ boot | tojson }};
+</script>
+<link rel="stylesheet" href="/assets/meta_omnichannel/frontend/omnichannel.css">
+<script defer src="/assets/meta_omnichannel/frontend/omnichannel.js"></script>
+{% endblock %}
