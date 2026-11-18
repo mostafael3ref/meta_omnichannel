@@ -19,10 +19,122 @@ PROVIDER = "Facebook"
 MAX_CONVERSATION_PAGES = 5
 MAX_MESSAGE_PAGES = 3
 
+# Connector attachment ``type`` → Omnichannel Message.message_type
+_ATTACHMENT_TYPE_MAP = {
+	"image": "Image",
+	"audio": "Audio",
+	"video": "Video",
+	"file": "File",
+}
+
 
 def _payload_hash(payload: Any) -> str:
 	raw = json.dumps(payload, sort_keys=True, default=str)
 	return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def extract_connector_attachments(row: dict[str, Any]) -> list[dict[str, str | None]]:
+	"""Normalize connector attachment payloads into ``{type, url, mime}`` dicts.
+
+	Supports the confirmed ``attachments: [{type, url}]`` list plus legacy
+	top-level ``attachment_url`` / ``media_url``. Malformed entries are skipped.
+	MIME is copied only when the connector supplies a value — never invented.
+	"""
+	found: list[dict[str, str | None]] = []
+	seen_urls: set[str] = set()
+
+	raw_list = row.get("attachments")
+	if isinstance(raw_list, list):
+		for item in raw_list:
+			if not isinstance(item, dict):
+				continue
+			url = str(item.get("url") or "").strip()
+			if not url or url in seen_urls:
+				continue
+			atype = str(item.get("type") or "").strip().lower()
+			mime_raw = item.get("mime_type") or item.get("mime") or item.get("attachment_mime")
+			mime = str(mime_raw).strip() if mime_raw else None
+			found.append({"type": atype or None, "url": url, "mime": mime or None})
+			seen_urls.add(url)
+
+	top_url = str(row.get("attachment_url") or row.get("media_url") or "").strip()
+	if top_url and top_url not in seen_urls:
+		top_type = str(row.get("attachment_type") or row.get("media_type") or "").strip().lower()
+		mime_raw = row.get("mime_type") or row.get("attachment_mime")
+		mime = str(mime_raw).strip() if mime_raw else None
+		# Prefer top-level URL as primary when no list attachments were found.
+		entry = {"type": top_type or None, "url": top_url, "mime": mime or None}
+		if found:
+			found.append(entry)
+		else:
+			found.insert(0, entry)
+		seen_urls.add(top_url)
+
+	return found
+
+
+def resolve_message_type_and_attachment(
+	*, text: str, attachments: list[dict[str, str | None]]
+) -> tuple[str, str | None, str | None]:
+	"""Return ``(message_type, attachment_url, attachment_mime)``.
+
+	Schema limitation: Omnichannel Message has a single ``attachment_url``.
+	Only the **primary** (first valid) attachment is persisted. Additional
+	attachments are recognized for dedup hashing but are **not** stored and are
+	**not** written into ``text_content`` / ``content`` (Text Editor must not
+	receive untrusted URLs/HTML). This is not full multi-attachment support.
+	"""
+	primary = attachments[0] if attachments else None
+	attachment_url = primary["url"] if primary else None
+	attachment_mime = primary.get("mime") if primary else None
+
+	if primary:
+		mapped = _ATTACHMENT_TYPE_MAP.get((primary.get("type") or "").lower())
+		if mapped:
+			message_type = mapped
+		elif text:
+			message_type = "Text"
+		else:
+			message_type = "Unknown"
+	else:
+		message_type = "Text" if text else "Unknown"
+
+	return message_type, attachment_url, attachment_mime
+
+
+def build_message_dedup_fingerprint(
+	*,
+	conversation: str,
+	text: str,
+	sent_at: Any,
+	direction: str,
+	attachments: list[dict[str, str | None]],
+) -> str:
+	"""Build ``raw_payload_hash`` for messages without an external id.
+
+	Compatibility strategy (narrow / fail-safe):
+
+	- **No attachments:** exact legacy payload ``{c, t, s, d}`` so existing
+	  text-only rows keep the same fingerprint.
+	- **With attachments:** include ``a`` (type, url) tuples so distinct
+	  attachment-only rows do not collide on empty text.
+	- **Do not** fall back to the legacy text-only fingerprint when attachments
+	  are present — that would incorrectly merge different media that share the
+	  same conversation / empty text / timestamp / direction.
+
+	Limitation: pre-change attachment-only rows stored under the legacy empty-text
+	hash (no ``a``) cannot be reliably matched without schema metadata; re-sync
+	may insert a second row rather than guessing a merge.
+	"""
+	fp_payload: dict[str, Any] = {
+		"c": conversation,
+		"t": text,
+		"s": sent_at,
+		"d": direction,
+	}
+	if attachments:
+		fp_payload["a"] = [(a.get("type"), a.get("url")) for a in attachments]
+	return _payload_hash(fp_payload)
 
 
 def _ensure_facebook_channel(page_id: str, page_name: str | None = None) -> str:
@@ -123,6 +235,13 @@ def upsert_message_from_connector(conversation: str, channel: str, row: dict[str
 		else:
 			direction = "Inbound"
 
+	attachments = extract_connector_attachments(row)
+	message_type, attachment_url, attachment_mime = resolve_message_type_and_attachment(
+		text=text, attachments=attachments
+	)
+	# Customer text only — never splice attachment URLs/HTML into Text Editor content.
+	text_content = text
+
 	if external_id:
 		existing = frappe.db.get_value(
 			"Omnichannel Message", {"external_message_id": external_id}, "name"
@@ -130,9 +249,14 @@ def upsert_message_from_connector(conversation: str, channel: str, row: dict[str
 		if existing:
 			return existing
 
-	# Dedup without external id: hash conversation + text + timestamp
 	sent_at = row.get("timestamp") or row.get("created_at") or row.get("sent_at")
-	fingerprint = _payload_hash({"c": conversation, "t": text, "s": sent_at, "d": direction})
+	fingerprint = build_message_dedup_fingerprint(
+		conversation=conversation,
+		text=text,
+		sent_at=sent_at,
+		direction=direction,
+		attachments=attachments,
+	)
 	existing_fp = frappe.db.get_value("Omnichannel Message", {"raw_payload_hash": fingerprint}, "name")
 	if existing_fp:
 		return existing_fp
@@ -144,16 +268,16 @@ def upsert_message_from_connector(conversation: str, channel: str, row: dict[str
 			"channel": channel,
 			"provider": PROVIDER,
 			"direction": direction,
-			"message_type": "Text" if text else "Unknown",
-			"text_content": text,
-			"content": text,
+			"message_type": message_type,
+			"text_content": text_content,
+			"content": text_content,
 			"external_message_id": external_id or None,
 			"delivery_status": "Delivered" if direction == "Inbound" else "Sent",
 			"sent_at": get_datetime(sent_at) if sent_at else now_datetime(),
 			"sender_external_id": str(row.get("sender_id") or row.get("from") or ""),
 			"raw_payload_hash": fingerprint,
-			"attachment_url": row.get("attachment_url") or row.get("media_url"),
-			"attachment_mime": row.get("mime_type") or row.get("attachment_mime"),
+			"attachment_url": attachment_url,
+			"attachment_mime": attachment_mime,
 		}
 	)
 	doc.insert(ignore_permissions=True)
