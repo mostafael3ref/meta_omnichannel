@@ -1,5 +1,5 @@
 function boot() {
-  return window.__OMNICHANNEL_BOOT__ || {};
+  return window.omnichannelBoot || {};
 }
 
 function csrf() {

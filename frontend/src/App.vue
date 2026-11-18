@@ -119,7 +119,7 @@ async function assignToMe() {
   if (!selected.value) return;
   await call("meta_omnichannel.crm_integration.service.assign_conversation", {
     conversation: selected.value.name,
-    user: window.__OMNICHANNEL_BOOT__?.user,
+    user: window.omnichannelBoot?.user,
   });
   await openConversation(selected.value);
   await loadConversations();

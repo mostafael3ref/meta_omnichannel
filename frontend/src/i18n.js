@@ -54,12 +54,12 @@ const STRINGS = {
 };
 
 export function t(key) {
-  const lang = (window.__OMNICHANNEL_BOOT__?.lang || "en").toLowerCase();
+  const lang = (window.omnichannelBoot?.lang || "en").toLowerCase();
   const table = lang.startsWith("ar") ? STRINGS.ar : STRINGS.en;
   return table[key] || STRINGS.en[key] || key;
 }
 
 export function isRtl() {
-  const lang = (window.__OMNICHANNEL_BOOT__?.lang || "en").toLowerCase();
+  const lang = (window.omnichannelBoot?.lang || "en").toLowerCase();
   return lang.startsWith("ar");
 }

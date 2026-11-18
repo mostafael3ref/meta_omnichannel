@@ -3,7 +3,7 @@
  * Preferred path on Linux Bench: build Vue sources from /frontend via `npm run build`.
  */
 (function () {
-  const boot = window.__OMNICHANNEL_BOOT__ || {};
+  const boot = window.omnichannelBoot || {};
   const rtl = String(boot.lang || "en").toLowerCase().startsWith("ar");
   const i18n = {
     en: {

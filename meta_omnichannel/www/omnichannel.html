@@ -7,7 +7,7 @@
   <div class="omnichannel-boot">{{ _("Loading Omnichannel Inbox…") }}</div>
 </div>
 <script>
-  window.__OMNICHANNEL_BOOT__ = {{ boot | tojson }};
+  window.omnichannelBoot = {{ boot | tojson }};
 </script>
 <link rel="stylesheet" href="/assets/meta_omnichannel/frontend/omnichannel.css">
 <script defer src="/assets/meta_omnichannel/frontend/omnichannel.js"></script>
