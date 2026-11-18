@@ -108,9 +108,9 @@
   },
   {
    "fieldname": "attachment_url",
-   "fieldtype": "Data",
+   "fieldtype": "Small Text",
    "label": "Attachment URL",
-   "description": "Connector-hosted or public media URL metadata only"
+   "description": "Connector-hosted or public media URL metadata only. Full URL preserved (Facebook CDN URLs often exceed Data's 140-char limit)."
   },
   {
    "fieldname": "attachment_mime",
@@ -138,7 +138,7 @@
  ],
  "issingle": 0,
  "links": [],
- "modified": "2026-04-12 14:00:00.000000",
+ "modified": "2026-11-18 16:20:00.000000",
  "modified_by": "Administrator",
  "module": "Meta Omnichannel",
  "name": "Omnichannel Message",

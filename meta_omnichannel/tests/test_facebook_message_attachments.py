@@ -3,10 +3,38 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
+
+
+# Realistic Facebook CDN URL with signed query params — exceeds Data's 140-char default.
+_LONG_FB_CDN_URL = (
+	"https://scontent.xx.fbcdn.net/v/t1.15752-9/123456789_987654321098765_"
+	"1234567890123456789_n.jpg?_nc_cat=111&ccb=1-7&_nc_sid=9f807c&_nc_ohc="
+	"AbCdEfGhIjKlMnOpQrStUvWxYz0123456789&_nc_ht=scontent.xx.fbcdn.net&oh="
+	"00abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789&oe=65ABCDEF"
+)
+
+
+class TestAttachmentUrlSchema(unittest.TestCase):
+	"""DocType must store full CDN URLs (not Data/varchar 140)."""
+
+	def test_attachment_url_is_small_text(self):
+		path = (
+			Path(__file__).resolve().parents[1]
+			/ "meta_omnichannel"
+			/ "doctype"
+			/ "omnichannel_message"
+			/ "omnichannel_message.json"
+		)
+		meta = json.loads(path.read_text(encoding="utf-8"))
+		field = next(f for f in meta["fields"] if f["fieldname"] == "attachment_url")
+		self.assertEqual(field["fieldtype"], "Small Text")
+		self.assertGreater(len(_LONG_FB_CDN_URL), 140)
 
 
 class TestAttachmentHelpersPure(unittest.TestCase):
@@ -179,6 +207,30 @@ class TestUpsertMessageAttachments(unittest.TestCase):
 		self.assertEqual(fields["message_type"], "Image")
 		self.assertNotIn("Additional attachments", fields["text_content"])
 		self.assertNotIn("cdn.example/x.png", fields["content"])
+
+	def test_long_facebook_cdn_url_preserved_verbatim(self):
+		"""Regression: CharacterLengthExceededError when attachment_url was Data/140."""
+		self.assertGreater(len(_LONG_FB_CDN_URL), 140)
+		self.sync.upsert_message_from_connector(
+			"CONV",
+			"CH",
+			{
+				"direction": "inbound",
+				"message_id": "m-long-url",
+				"text": "",
+				"attachments": [{"type": "image", "url": _LONG_FB_CDN_URL}],
+			},
+		)
+		fields = self._inserted_fields()
+		self.assertEqual(fields["attachment_url"], _LONG_FB_CDN_URL)
+		self.assertEqual(len(fields["attachment_url"]), len(_LONG_FB_CDN_URL))
+		self.assertIn("?_nc_cat=", fields["attachment_url"])
+		self.assertIn("&oe=", fields["attachment_url"])
+		self.assertEqual(fields["message_type"], "Image")
+		# Must not truncate, strip query params, or push URL into Text Editor content.
+		self.assertNotIn("fbcdn.net", fields["content"])
+		self.assertEqual(fields["content"], "")
+		self.assertEqual(fields["text_content"], "")
 
 	def test_untrusted_html_like_urls_never_enter_content(self):
 		evil = 'https://evil.example/"/><script>alert(1)</script>'
