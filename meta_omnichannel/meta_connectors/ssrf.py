@@ -195,8 +195,9 @@ def validate_connector_base_url(url: str, *, resolve_dns: bool = True) -> str:
 def resolve_safe_destination(url: str) -> SafeDestination:
 	"""Resolve DNS once and return a destination pinned to a validated IP.
 
-	Fails closed if any resolved address is blocked. The returned ``ip`` is the
-	first address from ``getaddrinfo`` order after validation of all answers.
+	Fails closed if **any** resolved address is blocked. When both families are
+	present and safe, prefer a public IPv4 pin (IPv6-only destinations still
+	use IPv6).
 	"""
 	hostname, port, path, normalized_url = _parse_https_base(url)
 	addresses = _resolve_host_ips(hostname)
@@ -205,7 +206,8 @@ def resolve_safe_destination(url: str) -> SafeDestination:
 		if is_blocked_ip(ip):
 			raise ConnectorURLError(f"Host '{hostname}' resolves to a blocked address ({ip})")
 
-	chosen = addresses[0]
+	ipv4 = next((ip for ip in addresses if isinstance(ip, ipaddress.IPv4Address)), None)
+	chosen = ipv4 if ipv4 is not None else addresses[0]
 	return SafeDestination(
 		hostname=hostname,
 		port=port,

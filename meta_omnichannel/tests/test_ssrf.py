@@ -116,6 +116,55 @@ class TestValidateConnectorBaseURL(unittest.TestCase):
 			dest = resolve_safe_destination("https://connect.example.com")
 			self.assertEqual(dest.ip, "2001:4860:4860::8888")
 
+	def test_prefer_ipv4_when_ipv6_listed_first(self):
+		# Use non-documentation public IPv6 (2001:db8::/32 is reserved / blocked).
+		fake = [
+			(socket.AF_INET6, None, None, None, ("2001:4860:4860::8888", 0, 0, 0)),
+			(socket.AF_INET, None, None, None, ("1.2.3.4", 0)),
+		]
+		with patch("meta_omnichannel.meta_connectors.ssrf.socket.getaddrinfo", return_value=fake):
+			dest = resolve_safe_destination("https://connect.example.com")
+			self.assertEqual(dest.ip, "1.2.3.4")
+
+	def test_prefer_ipv4_when_ipv4_listed_first(self):
+		fake = [
+			(socket.AF_INET, None, None, None, ("8.8.8.8", 0)),
+			(socket.AF_INET6, None, None, None, ("2001:4860:4860::8844", 0, 0, 0)),
+		]
+		with patch("meta_omnichannel.meta_connectors.ssrf.socket.getaddrinfo", return_value=fake):
+			dest = resolve_safe_destination("https://connect.example.com")
+			self.assertEqual(dest.ip, "8.8.8.8")
+
+	def test_ipv6_only_still_selects_ipv6(self):
+		fake = [(socket.AF_INET6, None, None, None, ("2001:4860:4860::8844", 0, 0, 0))]
+		with patch("meta_omnichannel.meta_connectors.ssrf.socket.getaddrinfo", return_value=fake):
+			dest = resolve_safe_destination("https://connect.example.com")
+			self.assertEqual(dest.ip, "2001:4860:4860::8844")
+
+	def test_ipv4_only_selects_ipv4(self):
+		fake = [(socket.AF_INET, None, None, None, ("9.9.9.9", 0))]
+		with patch("meta_omnichannel.meta_connectors.ssrf.socket.getaddrinfo", return_value=fake):
+			dest = resolve_safe_destination("https://connect.example.com")
+			self.assertEqual(dest.ip, "9.9.9.9")
+
+	def test_reject_when_valid_ipv4_and_blocked_ipv6(self):
+		fake = [
+			(socket.AF_INET, None, None, None, ("1.2.3.4", 0)),
+			(socket.AF_INET6, None, None, None, ("::1", 0, 0, 0)),
+		]
+		with patch("meta_omnichannel.meta_connectors.ssrf.socket.getaddrinfo", return_value=fake):
+			with self.assertRaises(ConnectorURLError):
+				resolve_safe_destination("https://connect.example.com")
+
+	def test_reject_when_blocked_ipv4_and_valid_ipv6(self):
+		fake = [
+			(socket.AF_INET, None, None, None, ("10.0.0.1", 0)),
+			(socket.AF_INET6, None, None, None, ("2001:4860:4860::8888", 0, 0, 0)),
+		]
+		with patch("meta_omnichannel.meta_connectors.ssrf.socket.getaddrinfo", return_value=fake):
+			with self.assertRaises(ConnectorURLError):
+				resolve_safe_destination("https://connect.example.com")
+
 
 if __name__ == "__main__":
 	unittest.main()
