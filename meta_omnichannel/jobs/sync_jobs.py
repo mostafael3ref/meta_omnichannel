@@ -7,16 +7,16 @@ import frappe
 from meta_omnichannel.utils.logger import get_logger
 
 
-def enqueue_facebook_conversation_sync(limit: int = 50) -> str:
-	"""Enqueue a bounded Facebook inbox sync (conversations + recent messages)."""
-	return frappe.enqueue(
-		"meta_omnichannel.jobs.sync_jobs.run_facebook_conversation_sync",
-		queue="short",
-		timeout=600,
-		limit=limit,
-		job_name="omnichannel_facebook_conversation_sync",
-		deduplicate=True,
-	)
+def enqueue_facebook_conversation_sync(limit: int = 50):
+    """Enqueue a bounded Facebook inbox sync (conversations + recent messages)."""
+    return frappe.enqueue(
+        "meta_omnichannel.jobs.sync_jobs.run_facebook_conversation_sync",
+        queue="short",
+        timeout=600,
+        limit=limit,
+        job_id="omnichannel_facebook_conversation_sync",
+        deduplicate=True,
+    )
 
 
 def run_facebook_conversation_sync(limit: int = 50) -> dict:
@@ -36,15 +36,15 @@ def run_facebook_conversation_sync(limit: int = 50) -> dict:
 	return result
 
 
-def enqueue_conversation_message_sync(conversation: str) -> str:
-	return frappe.enqueue(
-		"meta_omnichannel.jobs.sync_jobs.run_conversation_message_sync",
-		queue="short",
-		timeout=300,
-		conversation=conversation,
-		job_name=f"omnichannel_msg_sync:{conversation}",
-		deduplicate=True,
-	)
+def enqueue_conversation_message_sync(conversation: str):
+    return frappe.enqueue(
+        "meta_omnichannel.jobs.sync_jobs.run_conversation_message_sync",
+        queue="short",
+        timeout=300,
+        conversation=conversation,
+        job_id=f"omnichannel_msg_sync:{conversation}",
+        deduplicate=True,
+    )
 
 
 def run_conversation_message_sync(conversation: str) -> dict:
