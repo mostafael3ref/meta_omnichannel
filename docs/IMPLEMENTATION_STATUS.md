@@ -11,7 +11,7 @@ Last updated: 2026-11-18 (Windows source checkout — Bench / live CRM not execu
 | 5 Instagram Direct | **List + sync (code)** | Conversation list + DocType sync implemented and offline-tested. **Not** verified on a live Frappe CRM install. History, send, and OAuth remain pending. Not full Instagram support. |
 | 6 WhatsApp Business | **Internal layer only** | Provider + models + window design; APIs pending |
 | 7 Meta OAuth onboarding | **UI/stub only** | CSRF state + pending contracts documented |
-| 8 Background jobs & notifications | **Complete (code)** | Enqueue helpers, hourly sync hook, assignment notifications |
+| 8 Background jobs & notifications | **Complete (code)** | Enqueue helpers, hourly sync hook, assignment notifications; Facebook inbound HMAC receiver (Connector client still pending) |
 | 9 Security & automated testing | **Partial** | Offline unit tests pass; Bench/IDOR integration tests pending |
 | 10 Packaging & release docs | **Complete (docs)** | README + docs suite; install commands not executed here |
 

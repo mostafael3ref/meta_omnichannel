@@ -65,6 +65,16 @@ Suggested (not confirmed):
 
 - Cursor-based conversation delta feed to avoid unbounded polling
 
+### Inbound notifications (Frappe receiver ready — Connector client pending)
+
+Frappe exposes a guest HMAC endpoint for near-real-time Facebook inbound
+message tips. Exact payload, headers, and signing rules:
+
+→ `docs/FACEBOOK_INBOUND_NOTIFICATIONS.md`
+
+Connector must POST after verifying Meta webhooks; Frappe never trusts
+caller-supplied conversation names or job paths.
+
 ## Frappe guarantees
 
 - No Meta access tokens stored in Frappe

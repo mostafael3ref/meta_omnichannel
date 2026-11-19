@@ -6,6 +6,14 @@
 - Read only server-side via `get_decrypted_password`
 - Never returned from whitelisted methods or logged
 
+## Inbound notification HMAC (Connector → Frappe)
+
+- Dedicated Password field `inbound_notification_secret` (not the Connector API key)
+- Requests signed with HMAC-SHA256 over `timestamp + '.' + raw_body`
+- Constant-time signature compare; 300s timestamp skew; Redis replay on `notification_id`
+- Guest endpoint; Connector must not send Frappe session cookies
+- Full contract: `docs/FACEBOOK_INBOUND_NOTIFICATIONS.md`
+
 ## SSRF / DNS rebinding
 
 - Code allowlist: approved connector hostname(s) only (docs example: `connector.example.com`)

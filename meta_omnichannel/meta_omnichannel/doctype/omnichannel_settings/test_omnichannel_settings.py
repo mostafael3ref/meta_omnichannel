@@ -30,6 +30,7 @@ class TestOmnichannelSettings(FrappeTestCase):
 			"connector_base_url",
 			"connector_tenant_id",
 			"connector_api_key",
+			"inbound_notification_secret",
 			"connection_status",
 			"last_successful_test",
 			"last_error_summary",
@@ -40,3 +41,5 @@ class TestOmnichannelSettings(FrappeTestCase):
 		meta = frappe.get_meta("Omnichannel Settings")
 		df = meta.get_field("connector_api_key")
 		self.assertEqual(df.fieldtype, "Password")
+		inbound = meta.get_field("inbound_notification_secret")
+		self.assertEqual(inbound.fieldtype, "Password")

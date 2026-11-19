@@ -13,6 +13,8 @@
     "connector_base_url",
     "connector_tenant_id",
     "connector_api_key",
+    "inbound_section",
+    "inbound_notification_secret",
     "status_section",
     "connection_status",
     "last_successful_test",
@@ -41,11 +43,23 @@
       "reqd": 1
     },
     {
-      "description": "API key for this tenant. Stored encrypted. Never shown in full after save.",
+      "description": "API key for this tenant (Frappe → Connector). Stored encrypted. Never shown in full after save. Do not reuse for inbound HMAC.",
       "fieldname": "connector_api_key",
       "fieldtype": "Password",
       "label": "Connector API Key",
       "reqd": 1
+    },
+    {
+      "fieldname": "inbound_section",
+      "fieldtype": "Section Break",
+      "label": "Inbound Notifications"
+    },
+    {
+      "description": "Dedicated HMAC secret for Connector → Frappe inbound Facebook notifications. Stored encrypted. Never sent to the browser. Use Rotate Inbound Notification Secret to provision. Distinct from the Connector API Key.",
+      "fieldname": "inbound_notification_secret",
+      "fieldtype": "Password",
+      "label": "Inbound Notification Secret",
+      "reqd": 0
     },
     {
       "fieldname": "status_section",
@@ -77,7 +91,7 @@
   "idx": 0,
   "issingle": 1,
   "links": [],
-  "modified": "2026-04-12 12:00:00.000000",
+  "modified": "2026-11-19 10:00:00.000000",
   "modified_by": "Administrator",
   "module": "Meta Omnichannel",
   "name": "Omnichannel Settings",

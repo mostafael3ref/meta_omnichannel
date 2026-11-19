@@ -48,9 +48,18 @@ def enqueue_conversation_message_sync(conversation: str) -> str:
 
 
 def run_conversation_message_sync(conversation: str) -> dict:
+	from meta_omnichannel.facebook_messenger.inbound import publish_conversation_updated
 	from meta_omnichannel.facebook_messenger.sync import sync_conversation_messages
 
-	return sync_conversation_messages(conversation)
+	result = sync_conversation_messages(conversation)
+	# Near-real-time Inbox refresh: non-sensitive identifiers only.
+	if result.get("ok"):
+		publish_conversation_updated(
+			conversation=conversation,
+			processed=result.get("processed"),
+			source="message_sync",
+		)
+	return result
 
 
 def scheduled_facebook_sync() -> None:

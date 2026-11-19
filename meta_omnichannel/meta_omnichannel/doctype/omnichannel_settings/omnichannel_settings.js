@@ -46,5 +46,40 @@ frappe.ui.form.on("Omnichannel Settings", {
 				},
 			});
 		});
+
+		frm.add_custom_button(__("Rotate Inbound Notification Secret"), () => {
+			frappe.confirm(
+				__(
+					"Generate a new inbound HMAC secret? The previous secret will stop working immediately. Copy the new value into the Meta Connector for this tenant."
+				),
+				() => {
+					frappe.call({
+						method: "meta_omnichannel.facebook_messenger.api.rotate_inbound_notification_secret",
+						freeze: true,
+						freeze_message: __("Generating secret..."),
+						callback(r) {
+							frm.reload_doc();
+							const secret = r && r.message && r.message.secret;
+							if (!secret) {
+								frappe.msgprint({
+									title: __("Inbound Secret"),
+									indicator: "red",
+									message: __("Could not generate inbound notification secret."),
+								});
+								return;
+							}
+							frappe.msgprint({
+								title: __("Inbound Notification Secret"),
+								indicator: "green",
+								message: __(
+									"Store this secret on the Meta Connector now. It will not be shown again:<br><br><code>{0}</code>",
+									[frappe.utils.escape_html(secret)]
+								),
+							});
+						},
+					});
+				}
+			);
+		});
 	},
 });
