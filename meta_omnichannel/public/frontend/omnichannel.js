@@ -225,7 +225,13 @@
 
   const REALTIME_EVENT = "omnichannel_conversation_updated";
   const REALTIME_DEBOUNCE_MS = 400;
+  const REALTIME_SUBSCRIBE_RETRY_MS = 250;
+  const REALTIME_SUBSCRIBE_MAX_ATTEMPTS = 40;
   let realtimeSubscribed = false;
+  let realtimeEventSocket = null;
+  let realtimeBoundSocket = null;
+  let realtimeSubscribeRetryTimer = null;
+  let realtimeSubscribeAttempts = 0;
   let realtimeDebounceTimer = null;
   let pendingRealtimeConversations = new Set();
   let realtimeReconnectBound = false;
@@ -879,13 +885,15 @@
     scheduleRealtimeRefresh(name);
   }
 
-  function ensureSocketConnected() {
+  /**
+   * Frappe v15 website uses lazy_connect: frappe.realtime.on() is a no-op until
+   * realtime.socket exists, and connect() is what clears lazy_connect.
+   * Do not call socket.connect() directly — use frappe.realtime.connect().
+   */
+  function ensureRealtimeConnected() {
     try {
       const rt = window.frappe && window.frappe.realtime;
-      const socket = rt && rt.socket;
-      if (socket && socket.disconnected && typeof socket.connect === "function") {
-        socket.connect();
-      }
+      if (rt && typeof rt.connect === "function") rt.connect();
     } catch (_) {}
   }
 
@@ -894,19 +902,71 @@
     scheduleRealtimeRefresh(state.selected && state.selected.name, { reconnect: true });
   }
 
+  function bindRealtimeConnectHandler(rt) {
+    const socket = rt && rt.socket;
+    if (!socket || typeof socket.on !== "function") return;
+    // Socket-aware: Frappe normally keeps one socket, but if it is replaced, rebind.
+    if (realtimeBoundSocket === socket) return;
+    if (realtimeBoundSocket && typeof realtimeBoundSocket.off === "function") {
+      try {
+        realtimeBoundSocket.off("connect", onRealtimeSocketConnect);
+      } catch (_) {}
+    }
+    realtimeBoundSocket = socket;
+    socket.on("connect", onRealtimeSocketConnect);
+  }
+
+  function scheduleRealtimeSubscribeRetry() {
+    if (realtimeSubscribeRetryTimer) return;
+    if (realtimeSubscribed && realtimeEventSocket) {
+      const rt = window.frappe && window.frappe.realtime;
+      if (rt && rt.socket && rt.socket === realtimeEventSocket) return;
+    }
+    if (realtimeSubscribeAttempts >= REALTIME_SUBSCRIBE_MAX_ATTEMPTS) return;
+    realtimeSubscribeAttempts += 1;
+    realtimeSubscribeRetryTimer = setTimeout(function () {
+      realtimeSubscribeRetryTimer = null;
+      subscribeRealtimeOnce();
+    }, REALTIME_SUBSCRIBE_RETRY_MS);
+  }
+
+  function clearRealtimeSubscribeRetry() {
+    if (!realtimeSubscribeRetryTimer) return;
+    clearTimeout(realtimeSubscribeRetryTimer);
+    realtimeSubscribeRetryTimer = null;
+  }
+
   function subscribeRealtimeOnce() {
-    if (realtimeSubscribed) return false;
     const rt = window.frappe && window.frappe.realtime;
-    if (!rt || typeof rt.on !== "function") return false;
-    realtimeSubscribed = true;
-    ensureSocketConnected();
-    rt.on(REALTIME_EVENT, onConversationUpdated);
+    // Frappe RealTimeClient.on() silently no-ops when socket is missing.
+    if (!rt || typeof rt.on !== "function" || !rt.socket) {
+      scheduleRealtimeSubscribeRetry();
+      return false;
+    }
+    // Already registered on the active socket — do not add duplicate listeners.
+    if (realtimeSubscribed && realtimeEventSocket === rt.socket) return false;
+
     try {
-      const socket = rt.socket;
-      if (socket && typeof socket.on === "function") {
-        socket.on("connect", onRealtimeSocketConnect);
+      // Drop handlers from a replaced socket instance before binding the new one.
+      if (realtimeEventSocket && realtimeEventSocket !== rt.socket && typeof realtimeEventSocket.off === "function") {
+        try {
+          realtimeEventSocket.off(REALTIME_EVENT, onConversationUpdated);
+        } catch (_) {}
       }
-    } catch (_) {}
+      // Bind reconnect handler before connect so the first connect is observed.
+      bindRealtimeConnectHandler(rt);
+      // Must run after socket exists and before marking subscribed.
+      rt.on(REALTIME_EVENT, onConversationUpdated);
+    } catch (_) {
+      // Registration failed — do not claim subscribed; keep bounded retries alive.
+      scheduleRealtimeSubscribeRetry();
+      return false;
+    }
+
+    ensureRealtimeConnected();
+    realtimeEventSocket = rt.socket;
+    realtimeSubscribed = true;
+    clearRealtimeSubscribeRetry();
     return true;
   }
 
@@ -945,6 +1005,16 @@
     },
     isSubscribed: function () {
       return realtimeSubscribed;
+    },
+    isConnectHandlerBound: function () {
+      const rt = window.frappe && window.frappe.realtime;
+      return !!(realtimeBoundSocket && rt && rt.socket === realtimeBoundSocket);
+    },
+    getBoundEventSocket: function () {
+      return realtimeEventSocket;
+    },
+    getBoundConnectSocket: function () {
+      return realtimeBoundSocket;
     },
     pendingCount: function () {
       return pendingRealtimeConversations.size;

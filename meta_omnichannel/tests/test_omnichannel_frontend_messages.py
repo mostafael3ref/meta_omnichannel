@@ -499,10 +499,18 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn(REALTIME_EVENT, js)
 		self.assertIn("frappe.realtime", js)
 		self.assertIn("rt.on(REALTIME_EVENT, onConversationUpdated)", js)
-		self.assertIn("if (realtimeSubscribed) return false", js)
-		self.assertEqual(js.count("subscribeRealtimeOnce()"), 2)  # def + boot call
-		self.assertIn("socket.connect()", js)
+		self.assertIn("realtimeSubscribed && realtimeEventSocket === rt.socket", js)
+		self.assertEqual(js.count("subscribeRealtimeOnce()"), 3)  # def + retry + boot
+		self.assertIn("rt.connect()", js)
+		self.assertIn("ensureRealtimeConnected", js)
+		self.assertIn("scheduleRealtimeSubscribeRetry", js)
+		self.assertIn("clearRealtimeSubscribeRetry", js)
 		self.assertIn('socket.on("connect", onRealtimeSocketConnect)', js)
+		self.assertIn("realtimeBoundSocket === socket", js)
+		# Must not mark subscribed before socket exists (Frappe on() no-ops).
+		self.assertIn("!rt.socket", js)
+		# Prefer Frappe lifecycle connect over raw socket.connect for lazy_connect.
+		self.assertNotRegex(js, r"socket\.disconnected.*socket\.connect\(\)")
 
 	def test_soft_message_refresh_skips_open_conversation_and_panel(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
@@ -547,7 +555,8 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 
 	def test_graceful_when_realtime_missing(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
-		self.assertIn("if (!rt || typeof rt.on !== \"function\") return false", js)
+		self.assertIn("!rt || typeof rt.on !== \"function\" || !rt.socket", js)
+		self.assertIn("scheduleRealtimeSubscribeRetry", js)
 		self.assertIn("subscribeRealtimeOnce();", js)
 		self.assertIn("loadList();", js)
 
@@ -733,12 +742,101 @@ root.querySelector = (sel) => queryOne(root, sel);
 
 const gate = { list: [], messages: [], panel: [] };
 function defer() {
+  let settled = false;
   let resolve, reject;
   const p = new Promise((res, rej) => { resolve = res; reject = rej; });
-  p.resolve = resolve;
-  p.reject = reject;
+  p.resolve = (v) => {
+    if (settled) return;
+    settled = true;
+    resolve(v);
+  };
+  p.reject = (e) => {
+    if (settled) return;
+    settled = true;
+    reject(e);
+  };
+  p.isSettled = () => settled;
   return p;
 }
+
+// Mirrors Frappe v15 RealTimeClient: on() no-ops without socket; connect() clears lazy_connect.
+function createMockSocket() {
+  const handlers = {};
+  return {
+    connected: false,
+    disconnected: true,
+    handlers,
+    connect() {
+      // Establish the transport; tests fire "connect" explicitly for reconnect cases
+      // so boot does not race a debounced soft list refresh.
+      this.connected = true;
+      this.disconnected = false;
+    },
+    on(event, fn) {
+      (handlers[event] = handlers[event] || []).push(fn);
+    },
+    off(event, fn) {
+      const list = handlers[event] || [];
+      handlers[event] = list.filter((x) => x !== fn);
+    },
+    listenerCount(event) {
+      return (handlers[event] || []).length;
+    },
+    emit(event, payload) {
+      (handlers[event] || []).forEach((fn) => fn(payload));
+    },
+  };
+}
+
+function createFrappeRealtime(opts) {
+  const options = opts || {};
+  const rt = {
+    lazy_connect: options.lazy_connect !== false,
+    socket: options.withSocket === false ? null : createMockSocket(),
+    connectCalls: 0,
+    onCalls: [],
+    connect() {
+      this.connectCalls += 1;
+      if (this.lazy_connect && this.socket) {
+        this.socket.connect();
+        this.lazy_connect = false;
+      }
+    },
+    on(event, callback) {
+      this.onCalls.push(event);
+      // Exact Frappe behavior: silent no-op until socket exists.
+      if (this.socket) {
+        this.connect();
+        this.socket.on(event, callback);
+      }
+    },
+    attachSocket() {
+      this.socket = createMockSocket();
+      return this.socket;
+    },
+    replaceSocket() {
+      this.socket = createMockSocket();
+      this.lazy_connect = true;
+      return this.socket;
+    },
+  };
+  if (rt.socket && options.autoConnect) {
+    rt.lazy_connect = false;
+    rt.socket.connected = true;
+    rt.socket.disconnected = false;
+  }
+  return rt;
+}
+
+const startWithoutSocket =
+  scenario.indexOf("lazy_") === 0 ||
+  scenario === "subscribe_waits_for_socket" ||
+  scenario === "registration_error_keeps_retrying";
+const realtime = createFrappeRealtime({
+  lazy_connect: true,
+  withSocket: !startWithoutSocket,
+  autoConnect: false,
+});
 
 const sandbox = {
   console,
@@ -760,12 +858,7 @@ const sandbox = {
   isNaN,
   csrf_token: "t",
   omnichannelBoot: { lang: "en", user: "agent@example.com", csrf_token: "t" },
-  frappe: {
-    realtime: {
-      on() {},
-      socket: { disconnected: false, connect() {}, on() {} },
-    },
-  },
+  frappe: { realtime: realtime },
   document: {
     activeElement: null,
     getElementById(id) { return id === "omnichannel-app" ? root : null; },
@@ -836,25 +929,121 @@ async function waitUntil(fn, label, tries = 100) {
   throw new Error("timeout: " + label + " list=" + gate.list.length + " messages=" + gate.messages.length);
 }
 
+const bootItems = [
+  { name: "CONV-A", participant_name: "A", provider: "Facebook", status: "Open", unread_count: 0 },
+];
+
+async function settleOpenListCalls(items) {
+  for (const entry of gate.list) {
+    if (!entry.d.isSettled()) entry.d.resolve(items || bootItems);
+  }
+}
+
 (async () => {
   await waitUntil(() => gate.list.length >= 1, "boot list");
-  gate.list[0].d.resolve([
-    { name: "CONV-A", participant_name: "A", provider: "Facebook", status: "Open", unread_count: 0 },
-  ]);
-  await sleep(30);
+  gate.list[0].d.resolve(bootItems);
+
+  if (scenario === "subscribe_waits_for_socket" || scenario === "lazy_connect_registers_listener") {
+    assert.strictEqual(api.isSubscribed(), false, "must not claim subscribed before socket exists");
+    assert.ok(!realtime.socket, "socket should be absent at boot for lazy scenario");
+    const sock = realtime.attachSocket();
+    await waitUntil(() => api.isSubscribed() === true, "retry subscribe after socket");
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(realtime.lazy_connect, false, "Frappe connect() must clear lazy_connect");
+    assert.ok(realtime.connectCalls >= 1);
+    assert.strictEqual(api.isConnectHandlerBound(), true);
+    // Duplicate subscribe must not add another conversation listener.
+    assert.strictEqual(api.subscribeRealtimeOnce(), false);
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(sock.listenerCount("connect"), 1);
+    console.log("OK " + scenario);
+    return;
+  }
+
+  if (scenario === "lazy_reconnect_no_duplicate_listeners") {
+    assert.strictEqual(api.isSubscribed(), false);
+    const sock = realtime.attachSocket();
+    await waitUntil(() => api.isSubscribed() === true, "subscribed");
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(sock.listenerCount("connect"), 1);
+    // Simulate transport reconnect callbacks on the same socket (Frappe keeps the socket).
+    sock.emit("connect");
+    sock.emit("connect");
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(sock.listenerCount("connect"), 1);
+    assert.strictEqual(api.subscribeRealtimeOnce(), false);
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 1);
+    // Reconnect soft refresh is debounced — settle without hanging the process.
+    await sleep((api.debounceMs || 400) + 80);
+    await settleOpenListCalls(bootItems);
+    console.log("OK lazy_reconnect_no_duplicate_listeners");
+    return;
+  }
+
+  if (scenario === "socket_replacement_rebinds_listeners") {
+    const sock1 = realtime.socket || realtime.attachSocket();
+    if (!api.isSubscribed()) {
+      assert.strictEqual(api.subscribeRealtimeOnce(), true);
+    }
+    await waitUntil(() => api.isSubscribed() === true, "subscribed on sock1");
+    assert.strictEqual(sock1.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(sock1.listenerCount("connect"), 1);
+    assert.strictEqual(api.getBoundEventSocket(), sock1);
+    assert.strictEqual(api.getBoundConnectSocket(), sock1);
+
+    const sock2 = realtime.replaceSocket();
+    assert.notStrictEqual(sock1, sock2);
+    // Same-socket guard must not block rebind after Frappe replaces the socket object.
+    assert.strictEqual(api.subscribeRealtimeOnce(), true);
+    assert.strictEqual(sock2.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(sock2.listenerCount("connect"), 1);
+    assert.strictEqual(api.getBoundEventSocket(), sock2);
+    assert.strictEqual(api.getBoundConnectSocket(), sock2);
+    // Old socket should not keep handlers after rebind cleanup.
+    assert.strictEqual(sock1.listenerCount("connect"), 0);
+    assert.strictEqual(sock1.listenerCount("omnichannel_conversation_updated"), 0);
+    // Second call on the new socket must not duplicate.
+    assert.strictEqual(api.subscribeRealtimeOnce(), false);
+    assert.strictEqual(sock2.listenerCount("omnichannel_conversation_updated"), 1);
+    assert.strictEqual(sock2.listenerCount("connect"), 1);
+    console.log("OK socket_replacement_rebinds_listeners");
+    return;
+  }
+
+  if (scenario === "registration_error_keeps_retrying") {
+    assert.strictEqual(api.isSubscribed(), false);
+    let blows = 1;
+    const originalOn = realtime.on.bind(realtime);
+    realtime.on = function (event, cb) {
+      if (blows > 0) {
+        blows -= 1;
+        throw new Error("simulated registration failure");
+      }
+      return originalOn(event, cb);
+    };
+    const sock = realtime.attachSocket();
+    assert.strictEqual(api.subscribeRealtimeOnce(), false);
+    assert.strictEqual(api.isSubscribed(), false);
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 0);
+    await waitUntil(() => api.isSubscribed() === true, "retry after registration error");
+    assert.strictEqual(sock.listenerCount("omnichannel_conversation_updated"), 1);
+    console.log("OK registration_error_keeps_retrying");
+    return;
+  }
 
   if (scenario === "soft_list_newest_wins") {
+    const base = gate.list.length;
     const p1 = api.softLoadList();
-    await waitUntil(() => gate.list.length >= 2, "soft1");
+    await waitUntil(() => gate.list.length >= base + 1, "soft1");
     api.setSearch("alpha");
     const p2 = api.softLoadList();
-    assert.strictEqual(gate.list[1].search, "");
+    assert.strictEqual(gate.list[base].search, "");
     api.setSearch("beta");
     const p3 = api.softLoadList();
-    gate.list[1].d.resolve([
+    gate.list[base].d.resolve([
       { name: "STALE", participant_name: "stale", provider: "Facebook", status: "Open", unread_count: 0 },
     ]);
-    await waitUntil(() => gate.list.length >= 3, "soft rerun");
+    await waitUntil(() => gate.list.length >= base + 2, "soft rerun");
     assert.strictEqual(gate.list[gate.list.length - 1].search, "beta");
     gate.list[gate.list.length - 1].d.resolve([
       { name: "CONV-BETA", participant_name: "beta", provider: "Facebook", status: "Open", unread_count: 0 },
@@ -989,8 +1178,9 @@ async function waitUntil(fn, label, tries = 100) {
     note.selectionStart = 2;
     note.selectionEnd = 2;
     note.focus();
+    const listBase = gate.list.length;
     const softP = api.softLoadList();
-    await waitUntil(() => gate.list.length >= 2, "soft list");
+    await waitUntil(() => gate.list.length >= listBase + 1, "soft list");
     gate.list[gate.list.length - 1].d.resolve([
       { name: "CONV-A", participant_name: "A", provider: "Facebook", status: "Open", unread_count: 0 },
       { name: "CONV-B", participant_name: "B", provider: "Facebook", status: "Open", unread_count: 0 },
@@ -1006,8 +1196,9 @@ async function waitUntil(fn, label, tries = 100) {
     search.focus();
     search.selectionStart = 2;
     search.selectionEnd = 2;
+    const listBase2 = gate.list.length;
     const softP2 = api.softLoadList();
-    await waitUntil(() => gate.list.length >= 3, "soft list 2");
+    await waitUntil(() => gate.list.length >= listBase2 + 1, "soft list 2");
     gate.list[gate.list.length - 1].d.resolve([
       { name: "CONV-A", participant_name: "A", provider: "Facebook", status: "Open", unread_count: 0 },
     ]);
@@ -1121,6 +1312,26 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_messages_gen_invalidate_during_open_clears_loading(self):
 		out = self._run_scenario("open_gen_invalidate_clears_loading")
 		self.assertIn("OK open_gen_invalidate_clears_loading", out)
+
+	def test_subscribe_waits_for_lazy_socket(self):
+		out = self._run_scenario("subscribe_waits_for_socket")
+		self.assertIn("OK subscribe_waits_for_socket", out)
+
+	def test_lazy_connect_registers_single_listener(self):
+		out = self._run_scenario("lazy_connect_registers_listener")
+		self.assertIn("OK lazy_connect_registers_listener", out)
+
+	def test_lazy_reconnect_does_not_duplicate_listeners(self):
+		out = self._run_scenario("lazy_reconnect_no_duplicate_listeners")
+		self.assertIn("OK lazy_reconnect_no_duplicate_listeners", out)
+
+	def test_socket_replacement_rebinds_listeners(self):
+		out = self._run_scenario("socket_replacement_rebinds_listeners")
+		self.assertIn("OK socket_replacement_rebinds_listeners", out)
+
+	def test_registration_error_keeps_retrying(self):
+		out = self._run_scenario("registration_error_keeps_retrying")
+		self.assertIn("OK registration_error_keeps_retrying", out)
 
 
 if __name__ == "__main__":
