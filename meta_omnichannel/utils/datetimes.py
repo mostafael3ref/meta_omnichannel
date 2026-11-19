@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def parse_connector_datetime(value: Any) -> datetime | None:
-	"""Convert a connector timestamp into a naive ``datetime``, or ``None``.
+	"""Convert a connector timestamp into a naive **UTC** ``datetime``, or ``None``.
 
 	Supports:
 
@@ -18,6 +19,9 @@ def parse_connector_datetime(value: Any) -> datetime | None:
 
 	Does **not** pass values through ``get_datetime(None)`` (which means "now").
 	Invalid or empty inputs return ``None`` and never raise.
+
+	For Frappe DocType Datetime storage (same convention as ``now_datetime()``),
+	use :func:`parse_connector_datetime_for_db`.
 	"""
 	if value is None:
 		return None
@@ -85,3 +89,59 @@ def _from_unix_epoch(ts: float) -> datetime | None:
 		return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
 	except (OverflowError, OSError, ValueError):
 		return None
+
+
+def _resolve_system_timezone_name(system_timezone: str | None = None) -> str:
+	"""Return the Frappe system timezone name (same source as ``now_datetime()``)."""
+	if system_timezone:
+		return system_timezone
+	from frappe.utils import get_system_timezone
+
+	return str(get_system_timezone())
+
+
+def utc_naive_to_system_naive(
+	dt: datetime, *, system_timezone: str | None = None
+) -> datetime:
+	"""Convert a connector UTC-naive (or tz-aware) datetime to Frappe DB convention.
+
+	Frappe v15 ``now_datetime()`` stores wall time in the site/system timezone as a
+	**naive** ``datetime``. Database Datetime fields follow that same convention.
+	Connector epochs / ``Z`` timestamps are UTC — convert before write so inbound
+	``sent_at`` aligns with ERPNext outbound timestamps.
+	"""
+	if dt.tzinfo is None:
+		aware_utc = dt.replace(tzinfo=timezone.utc)
+	else:
+		aware_utc = dt.astimezone(timezone.utc)
+	tz_name = _resolve_system_timezone_name(system_timezone)
+	try:
+		zone = ZoneInfo(tz_name)
+	except ZoneInfoNotFoundError:
+		zone = timezone.utc
+	return aware_utc.astimezone(zone).replace(tzinfo=None)
+
+
+def parse_connector_datetime_for_db(
+	value: Any, *, system_timezone: str | None = None
+) -> datetime | None:
+	"""Parse a connector timestamp and convert to naive system-timezone for DB storage.
+
+	Returns ``None`` for missing/invalid input (never raises, never means "now").
+	"""
+	parsed = parse_connector_datetime(value)
+	if parsed is None:
+		return None
+	return utc_naive_to_system_naive(parsed, system_timezone=system_timezone)
+
+
+def connector_timestamp_is_present(value: Any) -> bool:
+	"""True when the connector supplied a non-empty timestamp candidate."""
+	if value is None or isinstance(value, bool):
+		return False
+	if isinstance(value, str):
+		return bool(value.strip())
+	# int/float/datetime — including numeric 0 treated as absent/invalid upstream
+	if isinstance(value, (int, float)):
+		return value != 0
+	return True

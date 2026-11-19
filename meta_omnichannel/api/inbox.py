@@ -140,7 +140,8 @@ def list_messages(conversation: str, limit: int = 50, offset: int = 0) -> dict:
 			"error_summary",
 			"external_message_id",
 		],
-		order_by="sent_at asc",
+		# Stable chronology: primary sent_at, then creation/name for ties + pagination.
+		order_by="sent_at asc, creation asc, name asc",
 		limit_page_length=limit,
 		limit_start=offset,
 	)

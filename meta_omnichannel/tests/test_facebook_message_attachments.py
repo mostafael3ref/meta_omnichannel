@@ -48,6 +48,7 @@ class TestAttachmentHelpersPure(unittest.TestCase):
 		utils.cint = int  # type: ignore[attr-defined]
 		utils.get_datetime = lambda v: v  # type: ignore[attr-defined]
 		utils.now_datetime = MagicMock(return_value="2026-11-18 12:00:00")  # type: ignore[attr-defined]
+		utils.get_system_timezone = MagicMock(return_value="UTC")  # type: ignore[attr-defined]
 		sys.modules["frappe.utils"] = utils
 		import meta_omnichannel.facebook_messenger.sync as sync_mod
 
@@ -170,6 +171,7 @@ class TestUpsertMessageAttachments(unittest.TestCase):
 		utils.cint = int  # type: ignore[attr-defined]
 		utils.get_datetime = lambda v: v  # type: ignore[attr-defined]
 		utils.now_datetime = MagicMock(return_value="2026-11-18 12:00:00")  # type: ignore[attr-defined]
+		utils.get_system_timezone = MagicMock(return_value="UTC")  # type: ignore[attr-defined]
 		sys.modules["frappe.utils"] = utils
 		import meta_omnichannel.facebook_messenger.sync as sync_mod
 
@@ -180,6 +182,7 @@ class TestUpsertMessageAttachments(unittest.TestCase):
 	def setUp(self):
 		self.frappe.db.get_value.reset_mock(side_effect=True, return_value=True)
 		self.frappe.get_doc.reset_mock(side_effect=True, return_value=True)
+		self.frappe.db.set_value.reset_mock(side_effect=True, return_value=True)
 		self.frappe.db.get_value.side_effect = None
 		self.frappe.db.get_value.return_value = None
 		doc = MagicMock()
@@ -276,8 +279,12 @@ class TestUpsertMessageAttachments(unittest.TestCase):
 		self.assertNotIn("2.pdf", fields["text_content"])
 
 	def test_duplicate_external_id_skips_insert(self):
+		from types import SimpleNamespace
+
 		def get_value(doctype, filters=None, fieldname=None, *args, **kwargs):
 			if isinstance(filters, dict) and filters.get("external_message_id") == "dup-1":
+				if kwargs.get("as_dict") or isinstance(fieldname, (list, tuple)):
+					return SimpleNamespace(name="MSG-EXISTING", sent_at="2026-01-01 12:00:00")
 				return "MSG-EXISTING"
 			return None
 
@@ -289,6 +296,7 @@ class TestUpsertMessageAttachments(unittest.TestCase):
 		)
 		self.assertEqual(name, "MSG-EXISTING")
 		self.frappe.get_doc.assert_not_called()
+		self.frappe.db.set_value.assert_not_called()
 
 	def test_same_timestamp_different_urls_do_not_collide(self):
 		seen_hashes: list[str] = []

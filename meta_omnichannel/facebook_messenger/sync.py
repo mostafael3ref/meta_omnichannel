@@ -7,10 +7,14 @@ import json
 from typing import Any
 
 import frappe
-from frappe.utils import cint, get_datetime, now_datetime
+from frappe.utils import cint, now_datetime
 
 from meta_omnichannel.facebook_messenger.adapter import FacebookConnectorAdapter
 from meta_omnichannel.meta_connectors.errors import ConnectorError
+from meta_omnichannel.utils.datetimes import (
+	connector_timestamp_is_present,
+	parse_connector_datetime_for_db,
+)
 from meta_omnichannel.utils.logger import get_logger
 from meta_omnichannel.utils.sync_log import finish_sync_log, start_sync_log
 from meta_omnichannel.utils.threading_keys import facebook_thread_key as thread_key
@@ -186,7 +190,7 @@ def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 		or row.get("preview")
 		or ""
 	)
-	last_at = row.get("last_message_at") or row.get("updated_at") or row.get("timestamp")
+	last_at_raw = row.get("last_message_at") or row.get("updated_at") or row.get("timestamp")
 	participant_name = (
 		row.get("participant_name")
 		or row.get("sender_name")
@@ -203,11 +207,10 @@ def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 		"participant_name": participant_name,
 		"last_message_preview": str(preview)[:500],
 	}
-	if last_at:
-		try:
-			values["last_message_at"] = get_datetime(last_at)
-		except Exception:
-			pass
+	# Only set when parse succeeds — never write NULL / invent "now" for bad values.
+	parsed_last_at = parse_connector_datetime_for_db(last_at_raw)
+	if parsed_last_at is not None:
+		values["last_message_at"] = parsed_last_at
 
 	if name:
 		frappe.db.set_value("Omnichannel Conversation", name, values, update_modified=True)
@@ -216,6 +219,45 @@ def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 	doc = frappe.get_doc({"doctype": "Omnichannel Conversation", "status": "Open", **values})
 	doc.insert(ignore_permissions=True)
 	return doc.name
+
+
+def _raw_message_timestamp(row: dict[str, Any]) -> Any:
+	"""First non-empty connector timestamp candidate for a message row."""
+	for key in ("timestamp", "created_at", "sent_at"):
+		value = row.get(key)
+		if connector_timestamp_is_present(value):
+			return value
+	return None
+
+
+def _resolve_new_message_sent_at(raw_timestamp: Any):
+	"""Map connector timestamp → DB ``sent_at`` for a new message insert.
+
+	Policy:
+	- Valid connector timestamp → system-timezone naive datetime.
+	- Genuinely absent timestamp → ``now_datetime()`` (same as prior fallback).
+	- Present but invalid → ``None`` (never invent "now" for bad values).
+	"""
+	if not connector_timestamp_is_present(raw_timestamp):
+		return now_datetime()
+	parsed = parse_connector_datetime_for_db(raw_timestamp)
+	return parsed  # may be None when invalid
+
+
+def _maybe_repair_null_sent_at(message_name: str, current_sent_at: Any, raw_timestamp: Any) -> None:
+	"""Fill ``sent_at`` only when currently NULL and connector time parses cleanly."""
+	if current_sent_at is not None:
+		return
+	parsed = parse_connector_datetime_for_db(raw_timestamp)
+	if parsed is None:
+		return
+	frappe.db.set_value(
+		"Omnichannel Message",
+		message_name,
+		"sent_at",
+		parsed,
+		update_modified=False,
+	)
 
 
 def upsert_message_from_connector(conversation: str, channel: str, row: dict[str, Any]) -> str | None:
@@ -241,19 +283,30 @@ def upsert_message_from_connector(conversation: str, channel: str, row: dict[str
 	)
 	# Customer text only — never splice attachment URLs/HTML into Text Editor content.
 	text_content = text
+	raw_timestamp = _raw_message_timestamp(row)
 
 	if external_id:
+		# Match conversation + external id so repair never crosses threads.
 		existing = frappe.db.get_value(
-			"Omnichannel Message", {"external_message_id": external_id}, "name"
+			"Omnichannel Message",
+			{"external_message_id": external_id, "conversation": conversation},
+			["name", "sent_at"],
+			as_dict=True,
 		)
 		if existing:
-			return existing
+			_maybe_repair_null_sent_at(existing.name, existing.sent_at, raw_timestamp)
+			return existing.name
+		# Unique external_message_id elsewhere: never insert a duplicate.
+		elsewhere = frappe.db.get_value(
+			"Omnichannel Message", {"external_message_id": external_id}, "name"
+		)
+		if elsewhere:
+			return elsewhere
 
-	sent_at = row.get("timestamp") or row.get("created_at") or row.get("sent_at")
 	fingerprint = build_message_dedup_fingerprint(
 		conversation=conversation,
 		text=text,
-		sent_at=sent_at,
+		sent_at=raw_timestamp,
 		direction=direction,
 		attachments=attachments,
 	)
@@ -273,7 +326,7 @@ def upsert_message_from_connector(conversation: str, channel: str, row: dict[str
 			"content": text_content,
 			"external_message_id": external_id or None,
 			"delivery_status": "Delivered" if direction == "Inbound" else "Sent",
-			"sent_at": get_datetime(sent_at) if sent_at else now_datetime(),
+			"sent_at": _resolve_new_message_sent_at(raw_timestamp),
 			"sender_external_id": str(row.get("sender_id") or row.get("from") or ""),
 			"raw_payload_hash": fingerprint,
 			"attachment_url": attachment_url,
