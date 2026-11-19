@@ -8,6 +8,7 @@ import sys
 import time
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from meta_omnichannel.meta_connectors.inbound_hmac import (
@@ -22,6 +23,11 @@ from meta_omnichannel.meta_connectors.inbound_hmac import (
 
 
 SECRET = "test-inbound-hmac-secret-value"
+
+
+def _job(job_id: str = "job-1"):
+	"""Stand-in for an RQ Job (response must serialize ``.id``, not the object)."""
+	return SimpleNamespace(id=job_id)
 
 
 def _sign(body: bytes, *, timestamp: str, secret: str = SECRET) -> dict[str, str]:
@@ -56,7 +62,7 @@ def _install_fake_frappe() -> MagicMock:
 	frappe.get_request_header = MagicMock(return_value=None)
 	frappe.request = MagicMock()
 	frappe.request.get_data = MagicMock(return_value=b"{}")
-	frappe.enqueue = MagicMock(return_value="job-1")
+	frappe.enqueue = MagicMock(return_value=_job("job-1"))
 	frappe.whitelist = lambda *a, **k: (lambda fn: fn)
 	utils = types.ModuleType("frappe.utils")
 	utils.cint = int  # type: ignore[attr-defined]
@@ -255,7 +261,7 @@ class TestFacebookInboundNotifications(unittest.TestCase):
 		with patch.object(
 			self.inbound, "resolve_conversation_for_notification", return_value="CONV-1"
 		), patch.object(
-			self.inbound, "enqueue_inbound_message_sync", return_value="job-1"
+			self.inbound, "enqueue_inbound_message_sync", return_value=_job("job-1")
 		) as enq:
 			first = self._run(self._payload(notification_id="dup-1"))
 			second = self._run(self._payload(notification_id="dup-1"))
@@ -267,19 +273,44 @@ class TestFacebookInboundNotifications(unittest.TestCase):
 		with patch.object(
 			self.inbound, "resolve_conversation_for_notification", return_value="CONV-EXISTING"
 		), patch.object(
-			self.inbound, "enqueue_conversation_message_sync", return_value="job-9"
+			self.inbound, "enqueue_conversation_message_sync", return_value=_job("job-9")
 		) as enq:
 			out = self._run(self._payload())
 		self.assertTrue(out["ok"])
 		self.assertTrue(out["queued"])
 		self.assertEqual(out["conversation"], "CONV-EXISTING")
+		self.assertEqual(out["job"], "job-9")
 		enq.assert_called_once_with("CONV-EXISTING")
+
+	def test_job_response_serializes_id_not_rq_object(self):
+		"""Regression for 921e17f: HTTP JSON must not embed a raw RQ Job."""
+		rq_job = _job("rq-abc-123")
+		with patch.object(
+			self.inbound, "resolve_conversation_for_notification", return_value="CONV-1"
+		), patch.object(
+			self.inbound, "enqueue_inbound_message_sync", return_value=rq_job
+		):
+			out = self._run(self._payload(notification_id="ser-1"))
+		self.assertEqual(out["job"], "rq-abc-123")
+		# Must be JSON-serializable (str/None), not the Job/SimpleNamespace.
+		json.dumps(out)
+		self.assertIsInstance(out["job"], str)
+
+	def test_job_none_serializes_as_null(self):
+		with patch.object(
+			self.inbound, "resolve_conversation_for_notification", return_value="CONV-1"
+		), patch.object(
+			self.inbound, "enqueue_inbound_message_sync", return_value=None
+		):
+			out = self._run(self._payload(notification_id="ser-none"))
+		self.assertIsNone(out["job"])
+		json.dumps(out)
 
 	def test_new_conversation_resolved_locally_without_connector_http(self):
 		with patch.object(
 			self.inbound, "resolve_conversation_for_notification", return_value="CONV-NEW"
 		) as resolve, patch.object(
-			self.inbound, "enqueue_conversation_message_sync", return_value="job-new"
+			self.inbound, "enqueue_conversation_message_sync", return_value=_job("job-new")
 		), patch(
 			"meta_omnichannel.facebook_messenger.sync.sync_facebook_conversations"
 		) as list_sync:
@@ -389,10 +420,11 @@ class TestFacebookInboundNotifications(unittest.TestCase):
 		with patch.object(
 			self.inbound, "resolve_conversation_for_notification", return_value="CONV-1"
 		), patch.object(
-			self.inbound, "enqueue_inbound_message_sync", return_value="job-1"
+			self.inbound, "enqueue_inbound_message_sync", return_value=_job("job-1")
 		):
 			out = self._run(self._payload(notification_id="keep-1"))
 		self.assertTrue(out["queued"])
+		self.assertEqual(out["job"], "job-1")
 		self.cache.eval.assert_not_called()
 
 	def test_api_endpoint_maps_auth_error(self):
@@ -416,7 +448,7 @@ class TestFacebookInboundNotifications(unittest.TestCase):
 		with patch.object(
 			self.inbound, "resolve_conversation_for_notification", return_value="CONV-HTTP"
 		), patch.object(
-			self.inbound, "enqueue_conversation_message_sync", return_value="job-http"
+			self.inbound, "enqueue_conversation_message_sync", return_value=_job("job-http")
 		):
 			# process is called from api module's imported symbol — patch through api path
 			with patch.object(
@@ -427,6 +459,7 @@ class TestFacebookInboundNotifications(unittest.TestCase):
 				result = self.api.notify_facebook_inbound()
 		self.assertTrue(result["ok"])
 		self.assertTrue(result["queued"])
+		self.assertEqual(result["job"], "job-http")
 		# Only body kwarg — no payload=
 		_, kwargs = proc.call_args
 		self.assertEqual(kwargs.get("body"), body)
@@ -465,6 +498,349 @@ class TestFacebookInboundNotifications(unittest.TestCase):
 	def test_rate_limit_decorator_applied_to_guest_endpoint(self):
 		self.assertEqual(self.api._INBOUND_RATE_LIMIT, 180)
 		self.assertEqual(self.api._INBOUND_RATE_WINDOW_SEC, 60)
+
+
+class TestPermissionScopedRealtime(unittest.TestCase):
+	"""publish_conversation_updated must target authorized users only."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.frappe = _install_fake_frappe()
+		# Permission helpers need get_roles / session.
+		cls.frappe.session = MagicMock()
+		cls.frappe.session.user = "Administrator"
+		cls.frappe.get_roles = MagicMock(return_value=[])
+		cls.frappe.db.exists = MagicMock(return_value=True)
+
+		import meta_omnichannel.meta_connectors.permissions as admin_perm
+		import meta_omnichannel.permissions as perm_mod
+		import meta_omnichannel.facebook_messenger.inbound as inbound_mod
+		import meta_omnichannel.jobs.sync_jobs as jobs_mod
+
+		importlib.reload(admin_perm)
+		importlib.reload(perm_mod)
+		importlib.reload(inbound_mod)
+		importlib.reload(jobs_mod)
+		cls.inbound = inbound_mod
+		cls.perm = perm_mod
+		cls.jobs = jobs_mod
+
+	def setUp(self):
+		self.frappe.publish_realtime.reset_mock()
+		self.frappe.publish_realtime.side_effect = None
+		self.frappe.get_all.reset_mock()
+		self.frappe.get_all.side_effect = None
+		self.frappe.get_all.return_value = []
+		self.frappe.get_doc.reset_mock()
+		self.frappe.db.exists.reset_mock()
+		self.frappe.db.exists.side_effect = None
+		self.frappe.db.exists.return_value = True
+		self.frappe.db.get_value.reset_mock()
+		self.frappe.get_roles.reset_mock()
+
+		# Default: Has Role returns empty; tests inject candidates via get_all.
+		self.enabled: dict[str, int] = {}
+		self.roles: dict[str, list[str]] = {}
+		self._last_has_role_kwargs = {}
+
+		def _get_value(doctype, name, field=None, *a, **k):
+			if doctype == "User" and field == "enabled":
+				return self.enabled.get(name, 0)
+			return None
+
+		def _get_roles(user=None):
+			return list(self.roles.get(user or self.frappe.session.user, []))
+
+		self.frappe.db.get_value.side_effect = _get_value
+		self.frappe.get_roles.side_effect = _get_roles
+
+	def _conv(self, *, name="CONV-1", assigned_to=None):
+		doc = MagicMock()
+		doc.name = name
+		doc.get = MagicMock(
+			side_effect=lambda key, default=None: assigned_to if key == "assigned_to" else default
+		)
+		# Also support attribute access used by some code paths
+		doc.assigned_to = assigned_to
+		self.frappe.get_doc.return_value = doc
+		return doc
+
+	def _set_role_holders(self, users_by_role: dict[str, list[str]]):
+		"""Make get_all('Has Role') return plucked parents; honor limit_page_length.
+
+		Do not assert inside the mock — exceptions are swallowed by candidate lookup.
+		"""
+		self._last_has_role_kwargs: dict = {}
+
+		def _get_all(
+			doctype,
+			filters=None,
+			fields=None,
+			distinct=False,
+			pluck=None,
+			limit_page_length=None,
+			**kwargs,
+		):
+			if doctype != "Has Role":
+				return []
+			self._last_has_role_kwargs = {
+				"filters": filters,
+				"distinct": distinct,
+				"pluck": pluck,
+				"limit_page_length": limit_page_length,
+				**kwargs,
+			}
+			role_filter = (filters or {}).get("role")
+			wanted: set[str] = set()
+			if isinstance(role_filter, (list, tuple)) and len(role_filter) == 2 and role_filter[0] == "in":
+				wanted = set(role_filter[1])
+			elif isinstance(role_filter, str):
+				wanted = {role_filter}
+			out: list[str] = []
+			seen: set[str] = set()
+			for role, users in users_by_role.items():
+				if role not in wanted:
+					continue
+				for u in users:
+					if u in seen:
+						continue
+					seen.add(u)
+					out.append(u)
+			# Simulate get_list-style truncation if a positive page length is passed.
+			if limit_page_length not in (0, None) and int(limit_page_length) > 0:
+				out = out[: int(limit_page_length)]
+			return out
+
+		self.frappe.get_all.side_effect = _get_all
+
+	def _publish_users(self) -> list[str]:
+		users = []
+		for call in self.frappe.publish_realtime.call_args_list:
+			kwargs = call.kwargs
+			args = call.args
+			# event may be positional
+			self.assertTrue(kwargs.get("after_commit") is True or (len(args) >= 1 and kwargs.get("after_commit")))
+			self.assertIn("user", kwargs)
+			self.assertTrue(kwargs["user"])
+			self.assertNotEqual(kwargs.get("room"), "all")
+			# Must never omit user (would fall back to site room)
+			users.append(kwargs["user"])
+			# Payload shape
+			message = kwargs.get("message")
+			if message is None and len(args) >= 2:
+				message = args[1]
+			if message is None and "data" in kwargs:
+				# our code passes data as 2nd positional
+				pass
+			event = args[0] if args else kwargs.get("event")
+			self.assertEqual(event, self.inbound.REALTIME_EVENT)
+			payload = args[1] if len(args) > 1 else kwargs.get("message")
+			self.assertEqual(payload["conversation"], "CONV-1")
+			self.assertEqual(payload["provider"], "Facebook")
+			self.assertIn("source", payload)
+		return users
+
+	def test_system_manager_receives_event(self):
+		self._conv(assigned_to="agent@example.com")
+		self._set_role_holders({"System Manager": ["sm@example.com"]})
+		self.enabled = {"sm@example.com": 1, "Administrator": 0}
+		self.roles = {"sm@example.com": ["System Manager"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1", processed=1)
+		users = self._publish_users()
+		self.assertIn("sm@example.com", users)
+
+	def test_unassigned_agent_receives_event(self):
+		self._conv(assigned_to=None)
+		self._set_role_holders({"Omnichannel Agent": ["agent@example.com"]})
+		self.enabled = {"agent@example.com": 1, "Administrator": 0}
+		self.roles = {"agent@example.com": ["Omnichannel Agent"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.assertIn("agent@example.com", self._publish_users())
+
+	def test_assigned_agent_receives_event(self):
+		self._conv(assigned_to="owner@example.com")
+		self._set_role_holders({"Omnichannel Agent": ["owner@example.com", "other@example.com"]})
+		self.enabled = {"owner@example.com": 1, "other@example.com": 1, "Administrator": 0}
+		self.roles = {
+			"owner@example.com": ["Omnichannel Agent"],
+			"other@example.com": ["Omnichannel Agent"],
+		}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		users = self._publish_users()
+		self.assertIn("owner@example.com", users)
+		self.assertNotIn("other@example.com", users)
+
+	def test_unrelated_agent_excluded_from_assigned_conversation(self):
+		self._conv(assigned_to="owner@example.com")
+		self._set_role_holders({"Omnichannel Agent": ["stranger@example.com"]})
+		self.enabled = {"stranger@example.com": 1, "Administrator": 0}
+		self.roles = {"stranger@example.com": ["Omnichannel Agent"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.assertEqual(self._publish_users(), [])
+
+	def test_disabled_user_excluded(self):
+		self._conv(assigned_to=None)
+		self._set_role_holders({"Omnichannel Agent": ["disabled@example.com"]})
+		self.enabled = {"disabled@example.com": 0, "Administrator": 0}
+		self.roles = {"disabled@example.com": ["Omnichannel Agent"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.assertEqual(self.frappe.publish_realtime.call_count, 0)
+
+	def test_user_without_omnichannel_roles_excluded(self):
+		self._conv(assigned_to=None)
+		# Appears in Has Role wrongly but get_roles has no omnichannel role
+		self._set_role_holders({"Omnichannel Agent": ["sales@example.com"]})
+		self.enabled = {"sales@example.com": 1, "Administrator": 0}
+		self.roles = {"sales@example.com": ["Sales User"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.assertEqual(self.frappe.publish_realtime.call_count, 0)
+
+	def test_enabled_administrator_receives_event(self):
+		self._conv(assigned_to="someone@example.com")
+		self._set_role_holders({})
+		self.enabled = {"Administrator": 1}
+		self.roles = {"Administrator": []}  # special-cased in user_is_omnichannel_admin
+		self.inbound.publish_conversation_updated(conversation="CONV-1", processed=3)
+		users = self._publish_users()
+		self.assertEqual(users, ["Administrator"])
+		payload = self.frappe.publish_realtime.call_args.args[1]
+		self.assertEqual(payload["processed"], 3)
+
+	def test_missing_conversation_never_broadcasts(self):
+		self.frappe.db.exists.return_value = False
+		self.inbound.publish_conversation_updated(conversation="MISSING")
+		self.frappe.publish_realtime.assert_not_called()
+		self.frappe.get_doc.assert_not_called()
+
+	def test_every_publish_has_user_and_after_commit(self):
+		self._conv(assigned_to=None)
+		self._set_role_holders(
+			{
+				"System Manager": ["sm@example.com"],
+				"Omnichannel Agent": ["agent@example.com"],
+			}
+		)
+		self.enabled = {"sm@example.com": 1, "agent@example.com": 1, "Administrator": 1}
+		self.roles = {
+			"sm@example.com": ["System Manager"],
+			"agent@example.com": ["Omnichannel Agent"],
+			"Administrator": [],
+		}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.assertGreaterEqual(self.frappe.publish_realtime.call_count, 2)
+		for call in self.frappe.publish_realtime.call_args_list:
+			self.assertTrue(call.kwargs.get("user"))
+			self.assertTrue(call.kwargs.get("after_commit"))
+			self.assertNotIn("room", call.kwargs)
+			self.assertNotEqual(call.kwargs.get("room", None), "all")
+
+	def test_no_implicit_site_wide_room(self):
+		"""Calling without user would hit room 'all'; we always pass user=."""
+		self._conv(assigned_to=None)
+		self._set_role_holders({"Omnichannel Agent": ["agent@example.com"]})
+		self.enabled = {"agent@example.com": 1, "Administrator": 0}
+		self.roles = {"agent@example.com": ["Omnichannel Agent"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		for call in self.frappe.publish_realtime.call_args_list:
+			self.assertIn("user", call.kwargs)
+			# room must not be explicitly "all" and user must be set (avoids get_site_room)
+			self.assertNotEqual(call.kwargs.get("room"), "all")
+
+	def test_message_sync_success_still_publishes(self):
+		with patch(
+			"meta_omnichannel.facebook_messenger.sync.sync_conversation_messages",
+			return_value={"ok": True, "processed": 1},
+		), patch.object(self.inbound, "publish_conversation_updated") as pub:
+			# jobs module imported publish from inbound at call time
+			import meta_omnichannel.jobs.sync_jobs as jobs
+
+			importlib.reload(jobs)
+			out = jobs.run_conversation_message_sync("CONV-1")
+		self.assertTrue(out["ok"])
+		pub.assert_called_once()
+
+	def test_message_sync_failure_still_skips_publish(self):
+		with patch(
+			"meta_omnichannel.facebook_messenger.sync.sync_conversation_messages",
+			return_value={"ok": False, "error": "x"},
+		), patch.object(self.inbound, "publish_conversation_updated") as pub:
+			import meta_omnichannel.jobs.sync_jobs as jobs
+
+			importlib.reload(jobs)
+			jobs.run_conversation_message_sync("CONV-1")
+		pub.assert_not_called()
+
+	def test_publish_exception_does_not_raise(self):
+		self._conv(assigned_to=None)
+		self._set_role_holders({"Omnichannel Agent": ["agent@example.com"]})
+		self.enabled = {"agent@example.com": 1, "Administrator": 0}
+		self.roles = {"agent@example.com": ["Omnichannel Agent"]}
+		self.frappe.publish_realtime.side_effect = RuntimeError("socket down")
+		# Must not raise
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+
+	def test_role_holders_beyond_default_page_size_are_all_candidates(self):
+		"""get_all must use limit_page_length=0 so >20 role holders are not truncated."""
+		self._conv(assigned_to=None)
+		agents = [f"agent{i:02d}@example.com" for i in range(25)]
+		self._set_role_holders({"Omnichannel Agent": agents})
+		self.enabled = {u: 1 for u in agents}
+		self.enabled["Administrator"] = 0
+		self.roles = {u: ["Omnichannel Agent"] for u in agents}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		published = set(self._publish_users())
+		self.assertEqual(len(published), 25)
+		self.assertTrue(all(u in published for u in agents))
+		# Candidate lookup used unlimited page length + distinct
+		self.assertEqual(self._last_has_role_kwargs.get("limit_page_length"), 0)
+		self.assertTrue(self._last_has_role_kwargs.get("distinct"))
+		self.assertEqual(self._last_has_role_kwargs.get("pluck"), "parent")
+
+	def test_one_recipient_failure_does_not_block_others(self):
+		self._conv(assigned_to=None)
+		self._set_role_holders(
+			{"Omnichannel Agent": ["a@example.com", "b@example.com"]}
+		)
+		self.enabled = {"a@example.com": 1, "b@example.com": 1, "Administrator": 0}
+		self.roles = {
+			"a@example.com": ["Omnichannel Agent"],
+			"b@example.com": ["Omnichannel Agent"],
+		}
+
+		def _pub(*args, **kwargs):
+			if kwargs.get("user") == "a@example.com":
+				raise RuntimeError("fail a")
+			return None
+
+		self.frappe.publish_realtime.side_effect = _pub
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		users = [c.kwargs.get("user") for c in self.frappe.publish_realtime.call_args_list]
+		self.assertIn("a@example.com", users)
+		self.assertIn("b@example.com", users)
+		# Second recipient still attempted despite first failure
+		self.assertEqual(self.frappe.publish_realtime.call_count, 2)
+
+	def test_lookup_error_never_site_wide_broadcast(self):
+		"""Has Role failure must fail closed — no publish, even if Administrator is enabled."""
+		self._conv(assigned_to=None)
+		self.enabled = {"Administrator": 1}
+		self.roles = {"Administrator": []}
+		self.frappe.get_all.side_effect = RuntimeError("has role query failed")
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.frappe.publish_realtime.assert_not_called()
+
+	def test_conversation_exists_error_never_site_wide_broadcast(self):
+		self.frappe.db.exists.side_effect = RuntimeError("db down")
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.frappe.publish_realtime.assert_not_called()
+
+	def test_empty_recipients_never_site_wide_broadcast(self):
+		self._conv(assigned_to="owner@example.com")
+		self._set_role_holders({"Omnichannel Agent": ["stranger@example.com"]})
+		self.enabled = {"stranger@example.com": 1, "Administrator": 0}
+		self.roles = {"stranger@example.com": ["Omnichannel Agent"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1")
+		self.frappe.publish_realtime.assert_not_called()
 
 
 if __name__ == "__main__":

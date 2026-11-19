@@ -318,13 +318,81 @@ def enqueue_inbound_message_sync(conversation_name: str) -> str | None:
 	return enqueue_conversation_message_sync(conversation_name)
 
 
+def _candidate_omnichannel_users() -> list[str]:
+	"""Return role-holder candidates without scanning every User row.
+
+	Uses ``Has Role`` only (bounded by Omnichannel roles), plus Administrator.
+	Frappe v15 ``get_all`` defaults ``limit_page_length=0`` (no LIMIT); we set it
+	explicitly. ``distinct=True`` is supported by DatabaseQuery on v15.
+	"""
+	from meta_omnichannel.permissions import AGENT_ROLES
+
+	candidates: set[str] = set()
+	try:
+		# limit_page_length=0 → unlimited (same as get_all default on v15).
+		# Do not use get_list (defaults to 20) or omit this on older call sites.
+		rows = frappe.get_all(
+			"Has Role",
+			filters={"role": ["in", list(AGENT_ROLES)], "parenttype": "User"},
+			pluck="parent",
+			distinct=True,
+			limit_page_length=0,
+		)
+		for name in rows or []:
+			if name:
+				candidates.add(str(name))
+	except Exception:
+		# Fail closed: do not fall back to Administrator-only publish.
+		get_logger().info("omnichannel_realtime_candidate_lookup_failed")
+		raise
+
+	candidates.add("Administrator")
+	return sorted(candidates)
+
+
+def _user_is_enabled(user: str) -> bool:
+	if not user or user == "Guest":
+		return False
+	try:
+		return bool(frappe.db.get_value("User", user, "enabled"))
+	except Exception:
+		return False
+
+
+def _eligible_realtime_recipients(doc) -> list[str]:
+	"""Users allowed to see this conversation, using existing permission helpers."""
+	from meta_omnichannel.permissions import (
+		has_conversation_permission,
+		user_is_omnichannel_agent,
+	)
+
+	recipients: list[str] = []
+	for user in _candidate_omnichannel_users():
+		if not _user_is_enabled(user):
+			continue
+		if not user_is_omnichannel_agent(user):
+			continue
+		if not has_conversation_permission(doc, "read", user):
+			continue
+		recipients.append(user)
+	return recipients
+
+
 def publish_conversation_updated(
 	*,
 	conversation: str,
 	processed: int | None = None,
 	source: str = "message_sync",
 ) -> None:
-	"""Site-scoped realtime ping with non-sensitive identifiers only."""
+	"""Permission-scoped realtime ping (per authorized user; never site-wide).
+
+	Payload is non-sensitive identifiers only. Failures never raise to the caller
+	so message sync success is preserved.
+	"""
+	conversation = (conversation or "").strip()
+	if not conversation:
+		return
+
 	data = {
 		"conversation": conversation,
 		"provider": PROVIDER,
@@ -332,14 +400,35 @@ def publish_conversation_updated(
 	}
 	if processed is not None:
 		data["processed"] = int(processed)
+
 	try:
-		frappe.publish_realtime(
-			REALTIME_EVENT,
-			data,
-			after_commit=True,
-		)
+		if not frappe.db.exists("Omnichannel Conversation", conversation):
+			return
+		doc = frappe.get_doc("Omnichannel Conversation", conversation)
+		recipients = _eligible_realtime_recipients(doc)
 	except Exception:
-		get_logger().info("omnichannel_realtime_publish_failed conversation=%s", conversation)
+		# Never fall back to site-wide broadcast on lookup/auth discovery errors.
+		get_logger().info(
+			"omnichannel_realtime_publish_failed conversation=%s",
+			conversation,
+		)
+		return
+
+	for user in recipients:
+		try:
+			# Always pass user= so Frappe targets user:{name}, never room "all".
+			frappe.publish_realtime(
+				REALTIME_EVENT,
+				data,
+				user=user,
+				after_commit=True,
+			)
+		except Exception:
+			# Isolate per-recipient failures; continue other users.
+			get_logger().info(
+				"omnichannel_realtime_publish_user_failed conversation=%s",
+				conversation,
+			)
 
 
 def process_facebook_inbound_notification(*, body: bytes) -> dict[str, Any]:
@@ -414,5 +503,6 @@ def process_facebook_inbound_notification(*, body: bytes) -> dict[str, Any]:
 		"queued": True,
 		"conversation": conversation,
 		"notification_id": notification_id,
+		# Serialize RQ Job id only (commit 921e17f) — never return the Job object.
 		"job": job.id if job is not None else None,
 	}
