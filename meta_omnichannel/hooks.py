@@ -33,6 +33,8 @@ website_route_rules = [
 	{"from_route": "/omnichannel", "to_route": "omnichannel"},
 ]
 
+# Facebook inbox coordinator (conversations + bounded messages). hourly_long keeps
+# Connector/API load moderate; overlapping runs are skipped via cache lock.
 scheduler_events = {
 	"hourly_long": [
 		"meta_omnichannel.jobs.sync_jobs.scheduled_facebook_sync",

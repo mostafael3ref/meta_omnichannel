@@ -8,11 +8,11 @@ from meta_omnichannel.utils.logger import get_logger
 
 
 def enqueue_facebook_conversation_sync(limit: int = 50) -> str:
-	"""Enqueue a bounded Facebook conversation sync job."""
+	"""Enqueue a bounded Facebook inbox sync (conversations + recent messages)."""
 	return frappe.enqueue(
 		"meta_omnichannel.jobs.sync_jobs.run_facebook_conversation_sync",
 		queue="short",
-		timeout=300,
+		timeout=600,
 		limit=limit,
 		job_name="omnichannel_facebook_conversation_sync",
 		deduplicate=True,
@@ -20,13 +20,18 @@ def enqueue_facebook_conversation_sync(limit: int = 50) -> str:
 
 
 def run_facebook_conversation_sync(limit: int = 50) -> dict:
-	from meta_omnichannel.facebook_messenger.sync import sync_facebook_conversations
+	"""Run the Facebook inbox coordinator (list + bounded message import)."""
+	from meta_omnichannel.facebook_messenger.sync import sync_facebook_inbox_bounded
 
-	result = sync_facebook_conversations(limit=limit)
+	result = sync_facebook_inbox_bounded(limit=limit)
+	messages = result.get("messages") or {}
 	get_logger().info(
-		"scheduled_facebook_sync ok=%s processed=%s",
+		"scheduled_facebook_sync ok=%s skipped=%s processed=%s messages_synced=%s messages_failed=%s",
 		result.get("ok"),
+		result.get("skipped"),
 		result.get("processed"),
+		messages.get("synced"),
+		len(messages.get("failed") or []),
 	)
 	return result
 
@@ -49,7 +54,12 @@ def run_conversation_message_sync(conversation: str) -> dict:
 
 
 def scheduled_facebook_sync() -> None:
-	"""Hourly-ish sync entrypoint from hooks.scheduler_events."""
+	"""Hourly-long scheduler entrypoint (hooks.scheduler_events).
+
+	Uses the same bounded coordinator as manual Sync. Hourly cadence balances
+	API load and worker overlap; do not switch to aggressive sub-minute polling
+	without reviewing Connector quotas and queue capacity.
+	"""
 	try:
 		run_facebook_conversation_sync(limit=50)
 	except Exception:

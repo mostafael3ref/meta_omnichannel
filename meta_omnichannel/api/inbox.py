@@ -199,10 +199,11 @@ def _ensure_can_trigger_connector_sync() -> None:
 
 @frappe.whitelist()
 def sync_facebook_inbox(limit: int = 50) -> dict:
+	"""Sync Facebook conversation list, then bounded recent/new message history."""
 	_ensure_can_trigger_connector_sync()
-	from meta_omnichannel.facebook_messenger.sync import sync_facebook_conversations
+	from meta_omnichannel.facebook_messenger.sync import sync_facebook_inbox_bounded
 
-	return sync_facebook_conversations(limit=cint(limit) or 50)
+	return sync_facebook_inbox_bounded(limit=cint(limit) or 50)
 
 
 @frappe.whitelist()
@@ -231,9 +232,10 @@ def _run_channel_sync(label: str, runner) -> dict:
 
 
 def _sync_facebook_conversations(limit: int) -> dict:
-	from meta_omnichannel.facebook_messenger.sync import sync_facebook_conversations
+	"""Facebook channel runner for ``sync_inbox`` (list + bounded messages)."""
+	from meta_omnichannel.facebook_messenger.sync import sync_facebook_inbox_bounded
 
-	return sync_facebook_conversations(limit=limit)
+	return sync_facebook_inbox_bounded(limit=limit)
 
 
 def _sync_instagram_conversations(limit: int) -> dict:
@@ -244,10 +246,11 @@ def _sync_instagram_conversations(limit: int) -> dict:
 
 @frappe.whitelist()
 def sync_inbox(limit: int = 50) -> dict:
-	"""Sync Facebook and Instagram conversation lists independently.
+	"""Sync Facebook (conversations + bounded messages) and Instagram list independently.
 
 	One channel failing does not prevent the other from running. The Unified
 	Inbox Sync button should call this method (not Graph / browser keys).
+	Instagram remains list-only until message sync is enabled for that provider.
 	"""
 	_ensure_can_trigger_connector_sync()
 	limit = cint(limit) or 50
@@ -267,9 +270,13 @@ def sync_inbox(limit: int = 50) -> dict:
 	if not instagram_ok:
 		errors.append(instagram.get("error") or "Instagram sync failed")
 
+	# Channel isolation: Instagram still runs when Facebook is ok:false/partial.
+	# Top-level partial covers either cross-channel or Facebook messages_partial.
+	cross_channel_partial = (facebook_ok or instagram_ok) and not (facebook_ok and instagram_ok)
+	facebook_partial = bool(facebook.get("partial"))
 	return {
 		"ok": facebook_ok and instagram_ok,
-		"partial": (facebook_ok or instagram_ok) and not (facebook_ok and instagram_ok),
+		"partial": cross_channel_partial or (facebook_partial and instagram_ok),
 		"facebook": facebook,
 		"instagram": instagram,
 		"error": " · ".join(errors) if errors else None,

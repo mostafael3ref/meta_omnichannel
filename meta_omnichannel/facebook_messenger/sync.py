@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
+from datetime import datetime
 from typing import Any
 
 import frappe
@@ -22,6 +24,18 @@ from meta_omnichannel.utils.threading_keys import facebook_thread_key as thread_
 PROVIDER = "Facebook"
 MAX_CONVERSATION_PAGES = 5
 MAX_MESSAGE_PAGES = 3
+# Bounded fan-out: after list sync, import messages for at most this many threads.
+DEFAULT_MAX_MESSAGE_CONVERSATIONS = 20
+FACEBOOK_INBOX_SYNC_LOCK_KEY = "omnichannel:facebook_inbox_sync"
+FACEBOOK_INBOX_SYNC_LOCK_TTL_SEC = 900  # 15 minutes; covers worst-case bounded run
+FACEBOOK_FAIR_CURSOR_KEY = "omnichannel:facebook_message_sync_fair_cursor"
+# Lua: delete lock only when ownership token still matches.
+_RELEASE_LOCK_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+	return redis.call('del', KEYS[1])
+end
+return 0
+"""
 
 # Connector attachment ``type`` → Omnichannel Message.message_type
 _ATTACHMENT_TYPE_MAP = {
@@ -172,6 +186,53 @@ def _extract_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
 	return []
 
 
+def _as_compare_datetime(value: Any) -> datetime | None:
+	"""Normalize a DB/connector datetime for ordering comparisons (naive)."""
+	if value is None or value == "":
+		return None
+	if isinstance(value, datetime):
+		return value.replace(tzinfo=None) if value.tzinfo is not None else value
+	return parse_connector_datetime_for_db(value)
+
+
+def _merge_conversation_preview_fields(
+	*,
+	existing_at: Any,
+	existing_preview: Any,
+	candidate_at: datetime | None,
+	candidate_preview: str,
+) -> dict[str, Any]:
+	"""Return preview fields to write, or {} if candidate must not overwrite.
+
+	Rules:
+	- Never move ``last_message_at`` backwards.
+	- Never apply preview/time without a valid candidate timestamp.
+	- On equal timestamps, never replace a non-empty existing preview with a
+	  different candidate (avoids unrelated/older same-second text). Only fill
+	  when the existing preview is blank.
+	- Older candidates are ignored entirely (protects outbound / newer connector state).
+	"""
+	preview = (candidate_preview or "").strip()
+	if candidate_at is None:
+		return {}
+
+	cur_at = _as_compare_datetime(existing_at)
+	existing_text = (existing_preview or "").strip()
+	if cur_at is None or candidate_at > cur_at:
+		out: dict[str, Any] = {"last_message_at": candidate_at}
+		if preview:
+			out["last_message_preview"] = preview[:500]
+		elif cur_at is None and not existing_text:
+			# Brand-new row may store empty preview with a valid timestamp.
+			out["last_message_preview"] = (candidate_preview or "")[:500]
+		return out
+
+	if candidate_at == cur_at and preview and not existing_text:
+		return {"last_message_preview": preview[:500]}
+
+	return {}
+
+
 def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 	page_id = str(row.get("page_id") or row.get("pageId") or "").strip()
 	sender_id = str(
@@ -182,14 +243,19 @@ def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 
 	channel = _ensure_facebook_channel(page_id, row.get("page_name") or row.get("pageName"))
 	key = thread_key(page_id, sender_id)
-	name = frappe.db.get_value("Omnichannel Conversation", {"external_thread_key": key}, "name")
-	preview = (
+	existing = frappe.db.get_value(
+		"Omnichannel Conversation",
+		{"external_thread_key": key},
+		["name", "last_message_at", "last_message_preview"],
+		as_dict=True,
+	)
+	preview = str(
 		row.get("last_message")
 		or row.get("last_message_text")
 		or row.get("snippet")
 		or row.get("preview")
 		or ""
-	)
+	)[:500]
 	last_at_raw = row.get("last_message_at") or row.get("updated_at") or row.get("timestamp")
 	participant_name = (
 		row.get("participant_name")
@@ -197,6 +263,7 @@ def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 		or row.get("name")
 		or sender_id
 	)
+	parsed_last_at = parse_connector_datetime_for_db(last_at_raw)
 
 	values = {
 		"channel": channel,
@@ -205,17 +272,24 @@ def upsert_conversation_from_connector(row: dict[str, Any]) -> str | None:
 		"page_id": page_id,
 		"participant_id": sender_id,
 		"participant_name": participant_name,
-		"last_message_preview": str(preview)[:500],
 	}
-	# Only set when parse succeeds — never write NULL / invent "now" for bad values.
-	parsed_last_at = parse_connector_datetime_for_db(last_at_raw)
+
+	if existing:
+		values.update(
+			_merge_conversation_preview_fields(
+				existing_at=existing.last_message_at,
+				existing_preview=existing.last_message_preview,
+				candidate_at=parsed_last_at,
+				candidate_preview=preview,
+			)
+		)
+		frappe.db.set_value("Omnichannel Conversation", existing.name, values, update_modified=True)
+		return existing.name
+
+	# Insert: only attach preview/time when timestamp parsed (no fabricated freshness).
 	if parsed_last_at is not None:
 		values["last_message_at"] = parsed_last_at
-
-	if name:
-		frappe.db.set_value("Omnichannel Conversation", name, values, update_modified=True)
-		return name
-
+		values["last_message_preview"] = preview
 	doc = frappe.get_doc({"doctype": "Omnichannel Conversation", "status": "Open", **values})
 	doc.insert(ignore_permissions=True)
 	return doc.name
@@ -402,28 +476,345 @@ def sync_conversation_messages(conversation_name: str, *, limit: int = 50, max_p
 				break
 			offset = cint(next_offset if next_offset is not None else offset + limit)
 
-		# Refresh preview from latest local message
-		latest = frappe.db.sql(
-			"""
-			select text_content, sent_at from `tabOmnichannel Message`
-			where conversation=%s and ifnull(is_internal_note,0)=0
-			order by sent_at desc limit 1
-			""",
-			conversation_name,
-			as_dict=True,
-		)
-		if latest:
-			frappe.db.set_value(
-				"Omnichannel Conversation",
-				conversation_name,
-				{
-					"last_message_preview": (latest[0].text_content or "")[:500],
-					"last_message_at": latest[0].sent_at,
-				},
-			)
+		# Refresh preview only when local latest is at least as fresh as conversation.
+		# Failures never reach here — ConnectorError skips preview updates entirely.
+		_maybe_refresh_conversation_preview_from_local_messages(conversation_name)
 		frappe.db.set_value("Omnichannel Channel", conv.channel, "last_synced_at", now_datetime())
 		finish_sync_log(log_name, status="Success", processed=processed, details={"pages": pages})
 		return {"ok": True, "processed": processed, "pages": pages, "sync_log": log_name}
 	except ConnectorError as exc:
 		finish_sync_log(log_name, status="Failed", processed=processed, error=str(exc))
 		return {"ok": False, "processed": processed, "error": str(exc), "sync_log": log_name}
+
+
+def _maybe_refresh_conversation_preview_from_local_messages(conversation_name: str) -> None:
+	"""Update conversation preview from local messages without rolling time backwards."""
+	current = frappe.db.get_value(
+		"Omnichannel Conversation",
+		conversation_name,
+		["last_message_at", "last_message_preview"],
+		as_dict=True,
+	)
+	if not current:
+		return
+	# Ignore NULL sent_at rows — they must not fabricate freshness.
+	latest = frappe.db.sql(
+		"""
+		select text_content, sent_at, name
+		from `tabOmnichannel Message`
+		where conversation=%s
+			and ifnull(is_internal_note,0)=0
+			and sent_at is not null
+		order by sent_at desc, name desc
+		limit 1
+		""",
+		conversation_name,
+		as_dict=True,
+	)
+	if not latest:
+		return
+	row = latest[0]
+	candidate_at = _as_compare_datetime(row.sent_at)
+	patch = _merge_conversation_preview_fields(
+		existing_at=current.last_message_at,
+		existing_preview=current.last_message_preview,
+		candidate_at=candidate_at,
+		candidate_preview=str(row.text_content or ""),
+	)
+	if patch:
+		frappe.db.set_value("Omnichannel Conversation", conversation_name, patch, update_modified=False)
+
+
+def _try_acquire_facebook_inbox_sync_lock() -> str | None:
+	"""Atomically acquire inbox sync lock. Returns ownership token, or None.
+
+	Uses Redis ``SET key token NX EX ttl`` via Frappe's RedisWrapper (``frappe.cache()``).
+	Fails **closed** on Redis errors (no concurrent run).
+	"""
+	try:
+		cache = frappe.cache()
+		token = secrets.token_hex(16)
+		key = cache.make_key(FACEBOOK_INBOX_SYNC_LOCK_KEY)
+		acquired = cache.set(key, token, nx=True, ex=FACEBOOK_INBOX_SYNC_LOCK_TTL_SEC)
+		return token if acquired else None
+	except Exception:
+		get_logger().info("facebook_inbox_sync_lock_unavailable")
+		return None
+
+
+def _release_facebook_inbox_sync_lock(token: str | None) -> None:
+	"""Release lock only if ``token`` still owns it (never deletes another worker's lock)."""
+	if not token:
+		return
+	try:
+		cache = frappe.cache()
+		key = cache.make_key(FACEBOOK_INBOX_SYNC_LOCK_KEY)
+		cache.eval(_RELEASE_LOCK_IF_OWNER, 1, key, token)
+	except Exception:
+		pass
+
+
+def _safe_message_sync_error(raw: Any) -> str:
+	"""Short, non-sensitive error text for API responses."""
+	text = str(raw or "").strip().split("\n")[0]
+	lower = text.lower()
+	for needle in ("authorization", "bearer", "api-key", "api_key", "x-api-key", "password", "secret"):
+		if needle in lower:
+			return "message sync failed"
+	return (text[:160] if text else "message sync failed")
+
+
+def _conversation_name(row: Any) -> str | None:
+	if row is None:
+		return None
+	if isinstance(row, dict):
+		return row.get("name")
+	return getattr(row, "name", None) or (row[0] if isinstance(row, (list, tuple)) and row else None)
+
+
+def _get_fair_sync_cursor() -> str:
+	try:
+		return str(frappe.cache().get_value(FACEBOOK_FAIR_CURSOR_KEY) or "")
+	except Exception:
+		return ""
+
+
+def _set_fair_sync_cursor(name: str) -> None:
+	try:
+		# No TTL: survive between hourly runs until Redis flush.
+		frappe.cache().set_value(FACEBOOK_FAIR_CURSOR_KEY, name)
+	except Exception:
+		pass
+
+
+def select_facebook_conversations_for_message_sync(
+	*, max_conversations: int = DEFAULT_MAX_MESSAGE_CONVERSATIONS
+) -> list[str]:
+	"""Choose Facebook threads for bounded message import (fair, non-starving).
+
+	Quota (of ``max_conversations``):
+
+	- ~50% recently active (``last_message_at`` desc) — includes newly bumped threads.
+	- ~25% empty / never-imported (capped; cannot consume the whole batch).
+	- remainder fair round-robin by ``name`` using a persisted cache cursor.
+
+	Does **not** treat preview text as proof a message is stored.
+	"""
+	limit = max(1, min(cint(max_conversations) or DEFAULT_MAX_MESSAGE_CONVERSATIONS, 100))
+	recent_quota = max(1, limit // 2)
+	empty_quota = max(1, limit // 4)
+	fair_quota = max(0, limit - recent_quota - empty_quota)
+
+	selected: list[str] = []
+	seen: set[str] = set()
+
+	def _take(names: list[str], quota: int) -> None:
+		for name in names:
+			if len(selected) >= limit:
+				return
+			if quota <= 0:
+				return
+			if name and name not in seen:
+				selected.append(name)
+				seen.add(name)
+				quota -= 1
+
+	recent = frappe.get_all(
+		"Omnichannel Conversation",
+		filters={"provider": PROVIDER, "is_archived": 0},
+		fields=["name"],
+		order_by="last_message_at desc, modified desc, name asc",
+		limit_page_length=recent_quota,
+	)
+	_take([_conversation_name(r) for r in (recent or [])], recent_quota)
+
+	empty_rows = frappe.db.sql(
+		"""
+		select c.name as name
+		from `tabOmnichannel Conversation` c
+		left join `tabOmnichannel Message` m on m.conversation = c.name
+		where c.provider = %s
+			and ifnull(c.is_archived, 0) = 0
+		group by c.name
+		having count(m.name) = 0
+		order by c.modified desc, c.name asc
+		limit %s
+		""",
+		(PROVIDER, empty_quota),
+		as_dict=True,
+	)
+	_take([_conversation_name(r) for r in (empty_rows or [])], empty_quota)
+
+	if fair_quota > 0 and len(selected) < limit:
+		all_names = [
+			_conversation_name(r)
+			for r in (
+				frappe.get_all(
+					"Omnichannel Conversation",
+					filters={"provider": PROVIDER, "is_archived": 0},
+					fields=["name"],
+					order_by="name asc",
+					limit_page_length=500,
+				)
+				or []
+			)
+		]
+		all_names = [n for n in all_names if n]
+		if all_names:
+			cursor = _get_fair_sync_cursor()
+			start = 0
+			if cursor in all_names:
+				start = (all_names.index(cursor) + 1) % len(all_names)
+			fair_picked: list[str] = []
+			for i in range(len(all_names)):
+				if len(fair_picked) >= fair_quota:
+					break
+				name = all_names[(start + i) % len(all_names)]
+				if name not in seen:
+					fair_picked.append(name)
+			if fair_picked:
+				_take(fair_picked, fair_quota)
+				_set_fair_sync_cursor(fair_picked[-1])
+
+	# If quotas left unused (e.g. few conversations), fill from recent remainder.
+	if len(selected) < limit:
+		more = frappe.get_all(
+			"Omnichannel Conversation",
+			filters={"provider": PROVIDER, "is_archived": 0},
+			fields=["name"],
+			order_by="last_message_at desc, modified desc, name asc",
+			limit_page_length=limit,
+		)
+		_take([_conversation_name(r) for r in (more or [])], limit - len(selected))
+
+	return selected[:limit]
+
+
+def sync_facebook_messages_for_conversations(
+	conversation_names: list[str],
+	*,
+	message_limit: int = 50,
+	max_message_pages: int = MAX_MESSAGE_PAGES,
+) -> dict[str, Any]:
+	"""Run ``sync_conversation_messages`` for each name; isolate per-conversation errors."""
+	synced = 0
+	failed: list[dict[str, str]] = []
+	processed_messages = 0
+	for name in conversation_names:
+		try:
+			result = sync_conversation_messages(
+				name,
+				limit=message_limit,
+				max_pages=max_message_pages,
+			)
+			if result.get("ok"):
+				synced += 1
+				processed_messages += cint(result.get("processed") or 0)
+			else:
+				failed.append(
+					{
+						"conversation": name,
+						"error": _safe_message_sync_error(result.get("error") or "message sync failed"),
+					}
+				)
+		except Exception as exc:
+			failed.append({"conversation": name, "error": _safe_message_sync_error(exc)})
+			get_logger().info(
+				"facebook_message_sync_conversation_failed conversation=%s", name
+			)
+
+	return {
+		"ok": len(failed) == 0,
+		"selected": len(conversation_names),
+		"synced": synced,
+		"failed": failed,
+		"processed_messages": processed_messages,
+	}
+
+
+def sync_facebook_inbox_bounded(
+	*,
+	limit: int = 50,
+	max_conversation_pages: int = MAX_CONVERSATION_PAGES,
+	max_message_conversations: int = DEFAULT_MAX_MESSAGE_CONVERSATIONS,
+	message_limit: int = 50,
+	max_message_pages: int = MAX_MESSAGE_PAGES,
+) -> dict[str, Any]:
+	"""Coordinator: conversation list sync, then bounded per-thread message sync.
+
+	Reuses ``sync_facebook_conversations`` and ``sync_conversation_messages``.
+	Overlapping runs are skipped via atomic Redis NX lock.
+	"""
+	token = _try_acquire_facebook_inbox_sync_lock()
+	if not token:
+		get_logger().info("facebook_inbox_sync_skipped lock_held_or_unavailable")
+		return {
+			"ok": False,
+			"skipped": True,
+			"partial": False,
+			"processed": 0,
+			"error": "Facebook inbox sync already in progress",
+		}
+
+	try:
+		conversations = sync_facebook_conversations(
+			limit=limit, max_pages=max_conversation_pages
+		)
+		messages: dict[str, Any] = {
+			"ok": True,
+			"selected": 0,
+			"synced": 0,
+			"failed": [],
+			"processed_messages": 0,
+		}
+
+		# Even if the list sync fails, still attempt message sync for known threads.
+		selected = select_facebook_conversations_for_message_sync(
+			max_conversations=max_message_conversations
+		)
+		if selected:
+			messages = sync_facebook_messages_for_conversations(
+				selected,
+				message_limit=message_limit,
+				max_message_pages=max_message_pages,
+			)
+
+		list_ok = bool(conversations.get("ok"))
+		msg_failed = bool(messages.get("failed"))
+		msg_synced = cint(messages.get("synced") or 0)
+
+		if list_ok and not msg_failed:
+			ok = True
+			partial = False
+			error = None
+		elif list_ok and msg_failed:
+			ok = False
+			partial = True
+			n = len(messages.get("failed") or [])
+			error = f"Message sync failed for {n} conversation(s)"
+		elif (not list_ok) and msg_synced:
+			ok = False
+			partial = True
+			error = _safe_message_sync_error(
+				conversations.get("error") or "Facebook conversation list sync failed"
+			)
+		else:
+			ok = False
+			partial = False
+			error = _safe_message_sync_error(
+				conversations.get("error") or "Facebook sync failed"
+			)
+
+		return {
+			"ok": ok,
+			"partial": partial,
+			"skipped": False,
+			"processed": conversations.get("processed", 0),
+			"pages": conversations.get("pages"),
+			"sync_log": conversations.get("sync_log"),
+			"conversations": conversations,
+			"messages": messages,
+			"error": error,
+		}
+	finally:
+		_release_facebook_inbox_sync_lock(token)
