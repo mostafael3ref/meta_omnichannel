@@ -31,6 +31,8 @@
       pending_channel: "Channel pending connector API",
       open_crm_lead: "Open Lead",
       open_contact: "Open Contact",
+      open_attachment: "Open attachment",
+      attachment_unavailable: "Attachment unavailable",
     },
     ar: {
       inbox: "الوارد",
@@ -57,12 +59,115 @@
       pending_channel: "القناة بانتظار واجهة الموصل",
       open_crm_lead: "فتح العميل المحتمل",
       open_contact: "فتح جهة الاتصال",
+      open_attachment: "فتح المرفق",
+      attachment_unavailable: "المرفق غير متاح",
     },
   };
   const t = (k) => (rtl ? i18n.ar : i18n.en)[k] || i18n.en[k] || k;
 
   function csrf() {
     return boot.csrf_token || window.csrf_token || "";
+  }
+
+  /** Accept https URLs only — never javascript:/data:/http:. */
+  function safeHttpsUrl(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return null;
+    try {
+      const u = new URL(s);
+      if (u.protocol !== "https:") return null;
+      return u.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function attachmentLinkLabel(messageType) {
+    const kind = String(messageType || "").trim();
+    if (kind === "Image" || kind === "Audio" || kind === "Video" || kind === "File") {
+      return rtl ? t("open_attachment") : `Open ${kind.toLowerCase()}`;
+    }
+    return t("open_attachment");
+  }
+
+  function renderSafeAttachmentLink(url, messageType) {
+    return el("a", {
+      className: "oc-attach-link",
+      href: url,
+      target: "_blank",
+      rel: "noopener noreferrer",
+      text: attachmentLinkLabel(messageType),
+    });
+  }
+
+  function renderAttachmentBlock(m) {
+    const raw = m.attachment_url;
+    const url = safeHttpsUrl(raw);
+    const type = m.message_type || "Unknown";
+    if (!url) {
+      if (raw) return el("div", { className: "oc-attach-fallback", text: t("attachment_unavailable") });
+      return null;
+    }
+    const wrap = el("div", { className: "oc-attach" });
+    const onMediaError = (ev) => {
+      const node = ev.currentTarget;
+      if (!node || !node.parentNode) return;
+      node.replaceWith(renderSafeAttachmentLink(url, type));
+    };
+    if (type === "Image") {
+      wrap.appendChild(
+        el("img", {
+          className: "oc-attach-media",
+          src: url,
+          alt: (m.text_content || "").trim() || "Image attachment",
+          loading: "lazy",
+          onerror: onMediaError,
+        })
+      );
+    } else if (type === "Audio") {
+      wrap.appendChild(
+        el("audio", {
+          className: "oc-attach-media",
+          src: url,
+          controls: true,
+          preload: "metadata",
+          onerror: onMediaError,
+        })
+      );
+    } else if (type === "Video") {
+      wrap.appendChild(
+        el("video", {
+          className: "oc-attach-media",
+          src: url,
+          controls: true,
+          preload: "metadata",
+          onerror: onMediaError,
+        })
+      );
+    } else {
+      wrap.appendChild(renderSafeAttachmentLink(url, type === "File" ? "File" : type));
+    }
+    return wrap;
+  }
+
+  function renderMessageBody(m) {
+    const parts = [];
+    const caption = String(m.text_content || "").trim();
+    const attach = renderAttachmentBlock(m);
+    if (caption) parts.push(el("div", { className: "oc-bubble-text", text: caption }));
+    if (attach) parts.push(attach);
+    if (!caption && !attach) parts.push(el("div", { text: m.message_type || "" }));
+    return parts;
+  }
+
+  function frappeErrorMessage(data, fallback) {
+    let message = fallback || "Request failed";
+    try {
+      const msgs = JSON.parse(data._server_messages || "[]");
+      if (msgs.length) message = JSON.parse(msgs[0]).message || message;
+    } catch (_) {}
+    if (data.exception) message = data.exception;
+    return message;
   }
 
   async function call(method, args) {
@@ -83,13 +188,10 @@
       body,
     });
     const data = await response.json();
-    if (data.exc || data._server_messages) {
-      let message = data.exc || "Request failed";
-      try {
-        const msgs = JSON.parse(data._server_messages || "[]");
-        if (msgs.length) message = JSON.parse(msgs[0]).message || message;
-      } catch (_) {}
-      throw new Error(message);
+    // Successful Frappe responses may include _server_messages (msgprint).
+    // Only treat HTTP errors / exc as failures — do not discard data.message.
+    if (!response.ok || data.exc) {
+      throw new Error(frappeErrorMessage(data, data.exc || "Request failed"));
     }
     return data.message;
   }
@@ -121,8 +223,92 @@
     loadingChat: false,
   };
 
+  const REALTIME_EVENT = "omnichannel_conversation_updated";
+  const REALTIME_DEBOUNCE_MS = 400;
+  let realtimeSubscribed = false;
+  let realtimeDebounceTimer = null;
+  let pendingRealtimeConversations = new Set();
+  let realtimeReconnectBound = false;
+  let listRefreshGen = 0;
+  let messagesRefreshGen = 0;
+  let openConversationSeq = 0;
+  let softListRunning = false;
+  let softListWanted = false;
+  let softListDone = null;
+  let pendingSoftMessageRefresh = null;
+
   const root = document.getElementById("omnichannel-app");
   if (!root) return;
+
+  /** Event payload is a hint only — require a nonempty conversation name string. */
+  function validateConversationHint(payload) {
+    if (!payload || typeof payload !== "object") return null;
+    const name = payload.conversation;
+    if (typeof name !== "string") return null;
+    const trimmed = name.trim();
+    return trimmed || null;
+  }
+
+  function isPermissionError(err) {
+    const msg = String((err && err.message) || err || "").toLowerCase();
+    return (
+      msg.includes("not permitted") ||
+      msg.includes("permissionerror") ||
+      msg.includes("permission denied") ||
+      msg.includes("forbidden") ||
+      msg.includes("403")
+    );
+  }
+
+  function captureFocusedField(selector) {
+    const node = root.querySelector(selector);
+    if (!node || document.activeElement !== node) return null;
+    return {
+      focus: true,
+      start: typeof node.selectionStart === "number" ? node.selectionStart : null,
+      end: typeof node.selectionEnd === "number" ? node.selectionEnd : null,
+    };
+  }
+
+  function restoreFocusedField(selector, field) {
+    if (!field || !field.focus) return;
+    const node = root.querySelector(selector);
+    if (!node) return;
+    node.focus();
+    if (field.start != null && field.end != null && typeof node.setSelectionRange === "function") {
+      try {
+        node.setSelectionRange(field.start, field.end);
+      } catch (_) {}
+    }
+  }
+
+  function captureUiChrome() {
+    const msgs = root.querySelector(".oc-messages");
+    const chrome = {
+      scrollTop: 0,
+      nearBottom: true,
+      composer: captureFocusedField(".oc-composer textarea"),
+      search: captureFocusedField(".oc-list-toolbar input[type='search']"),
+      note: captureFocusedField(".oc-customer textarea"),
+    };
+    if (msgs) {
+      chrome.scrollTop = msgs.scrollTop;
+      chrome.nearBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 80;
+    }
+    return chrome;
+  }
+
+  function restoreUiChrome(chrome) {
+    if (!chrome) return;
+    const msgs = root.querySelector(".oc-messages");
+    if (msgs) {
+      if (chrome.nearBottom) msgs.scrollTop = msgs.scrollHeight;
+      else msgs.scrollTop = chrome.scrollTop;
+    }
+    restoreFocusedField(".oc-composer textarea", chrome.composer);
+    restoreFocusedField(".oc-list-toolbar input[type='search']", chrome.search);
+    restoreFocusedField(".oc-customer textarea", chrome.note);
+  }
 
   function el(tag, attrs, children) {
     const node = document.createElement(tag);
@@ -130,6 +316,7 @@
       if (k === "className") node.className = v;
       else if (k === "text") node.textContent = v;
       else if (k === "html") node.innerHTML = v;
+      else if (k === "value") node.value = v == null ? "" : v;
       else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2).toLowerCase(), v);
       else if (v !== false && v != null) node.setAttribute(k, v === true ? "" : v);
     });
@@ -137,46 +324,204 @@
     return node;
   }
 
+  function listConversationArgs() {
+    const args = { limit: 40, offset: 0 };
+    if (state.search) args.search = state.search;
+    if (["Facebook", "Instagram", "WhatsApp"].includes(state.filter)) args.provider = state.filter;
+    if (state.filter === "me") args.assigned = "me";
+    if (state.filter === "unassigned") args.assigned = "unassigned";
+    return args;
+  }
+
+  function mergeSelectedFromList(items) {
+    if (!state.selected || !state.selected.name) return;
+    const fresh = (items || []).find((c) => c && c.name === state.selected.name);
+    if (!fresh) return;
+    state.selected = Object.assign({}, state.selected, {
+      participant_name: fresh.participant_name,
+      participant_id: fresh.participant_id,
+      provider: fresh.provider,
+      status: fresh.status,
+      last_message_at: fresh.last_message_at,
+      last_message_preview: fresh.last_message_preview,
+      unread_count: fresh.unread_count,
+    });
+  }
+
   async function loadList() {
     state.loadingList = true;
     state.error = "";
+    const gen = ++listRefreshGen;
     render();
     try {
-      const args = { limit: 40, offset: 0 };
-      if (state.search) args.search = state.search;
-      if (["Facebook", "Instagram", "WhatsApp"].includes(state.filter)) args.provider = state.filter;
-      if (state.filter === "me") args.assigned = "me";
-      if (state.filter === "unassigned") args.assigned = "unassigned";
-      const data = await call("meta_omnichannel.api.inbox.list_conversations", args);
+      const data = await call("meta_omnichannel.api.inbox.list_conversations", listConversationArgs());
+      if (gen !== listRefreshGen) return;
       let items = data.items || [];
       if (state.filter === "unread") items = items.filter((c) => (c.unread_count || 0) > 0);
       state.conversations = items;
+      mergeSelectedFromList(items);
     } catch (e) {
+      if (gen !== listRefreshGen) return;
       state.error = e.message || String(e);
     } finally {
-      state.loadingList = false;
+      if (gen === listRefreshGen) state.loadingList = false;
+      render();
+    }
+  }
+
+  /**
+   * Soft list refresh for realtime — no loading flash.
+   * Coalesces overlapping calls so the newest filter/search query always runs and wins.
+   */
+  async function softLoadList() {
+    softListWanted = true;
+    if (softListRunning) return softListDone;
+    softListRunning = true;
+    softListDone = (async () => {
+      try {
+        while (softListWanted) {
+          softListWanted = false;
+          const gen = ++listRefreshGen;
+          const args = listConversationArgs();
+          try {
+            const data = await call("meta_omnichannel.api.inbox.list_conversations", args);
+            if (gen !== listRefreshGen || softListWanted) continue;
+            let items = data.items || [];
+            if (state.filter === "unread") items = items.filter((c) => (c.unread_count || 0) > 0);
+            state.conversations = items;
+            mergeSelectedFromList(items);
+            render({ preserveChat: true });
+          } catch (e) {
+            if (gen !== listRefreshGen || softListWanted) continue;
+            state.error = e.message || String(e);
+            render({ preserveChat: true });
+          }
+        }
+      } finally {
+        softListRunning = false;
+        softListDone = null;
+      }
+    })();
+    return softListDone;
+  }
+
+  function clearInaccessibleConversation() {
+    state.selected = null;
+    state.messages = [];
+    state.panel = null;
+    state.draft = "";
+    state.note = "";
+    state.loadingChat = false;
+    pendingSoftMessageRefresh = null;
+    state.error = t("empty_chat");
+    messagesRefreshGen += 1;
+    openConversationSeq += 1;
+    render();
+  }
+
+  async function drainPendingSoftMessageRefresh() {
+    const pending = pendingSoftMessageRefresh;
+    pendingSoftMessageRefresh = null;
+    if (!pending) return;
+    if (!state.selected || state.selected.name !== pending) return;
+    if (state.loadingChat) {
+      pendingSoftMessageRefresh = pending;
+      return;
+    }
+    await softRefreshMessages(pending);
+  }
+
+  /** Refresh messages for the active thread only — never reloads customer panel. */
+  async function softRefreshMessages(conversationName) {
+    if (!conversationName || !state.selected || state.selected.name !== conversationName) return;
+    // Queue until openConversation finishes so realtime hints are not dropped.
+    if (state.loadingChat) {
+      pendingSoftMessageRefresh = conversationName;
+      return;
+    }
+    const gen = ++messagesRefreshGen;
+    const selectedName = conversationName;
+    try {
+      const msgData = await call("meta_omnichannel.api.inbox.list_messages", {
+        conversation: selectedName,
+        limit: 100,
+        offset: 0,
+      });
+      if (gen !== messagesRefreshGen) return;
+      if (!state.selected || state.selected.name !== selectedName) return;
+      state.messages = (msgData && msgData.items) || [];
+      state.selected.unread_count = 0;
+      render();
+    } catch (e) {
+      if (gen !== messagesRefreshGen) return;
+      if (!state.selected || state.selected.name !== selectedName) return;
+      if (isPermissionError(e)) {
+        clearInaccessibleConversation();
+        return;
+      }
+      state.error = e.message || String(e);
       render();
     }
   }
 
   async function openConversation(row) {
+    const seq = ++openConversationSeq;
     state.selected = row;
     state.loadingChat = true;
     state.error = "";
+    messagesRefreshGen += 1;
+    const openGen = messagesRefreshGen;
     render();
+    // Outer try/finally guarantees loadingChat cleanup + pending drain even when
+    // the list_messages phase returns early (e.g. messagesRefreshGen invalidated).
     try {
-      const [msgData, customer] = await Promise.all([
-        call("meta_omnichannel.api.inbox.list_messages", { conversation: row.name, limit: 100, offset: 0 }),
-        call("meta_omnichannel.crm_integration.service.get_customer_panel", { conversation: row.name }),
-      ]);
-      state.messages = msgData.items || [];
-      state.panel = customer;
-      row.unread_count = 0;
-    } catch (e) {
-      state.error = e.message || String(e);
+      // Load messages independently of the customer panel so a panel failure
+      // cannot leave .oc-messages empty after a successful list_messages call.
+      try {
+        const msgData = await call("meta_omnichannel.api.inbox.list_messages", {
+          conversation: row.name,
+          limit: 100,
+          offset: 0,
+        });
+        if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
+        if (!state.selected || state.selected.name !== row.name) return;
+        state.messages = (msgData && msgData.items) || [];
+        row.unread_count = 0;
+      } catch (e) {
+        if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
+        if (!state.selected || state.selected.name !== row.name) return;
+        if (isPermissionError(e)) {
+          clearInaccessibleConversation();
+          return;
+        }
+        state.messages = [];
+        state.error = e.message || String(e);
+      }
+
+      try {
+        if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
+        if (!state.selected || state.selected.name !== row.name) return;
+        state.panel = await call("meta_omnichannel.crm_integration.service.get_customer_panel", {
+          conversation: row.name,
+        });
+      } catch (e) {
+        if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
+        if (!state.selected || state.selected.name !== row.name) return;
+        state.panel = null;
+        if (isPermissionError(e)) {
+          clearInaccessibleConversation();
+          return;
+        }
+        if (!state.error) state.error = e.message || String(e);
+      }
     } finally {
+      // Only the current open may finalize; stale opens (including same-conversation
+      // reopen) must not touch loadingChat / drain for a newer request.
+      if (seq !== openConversationSeq) return;
+      if (!state.selected || state.selected.name !== row.name) return;
       state.loadingChat = false;
       render();
+      await drainPendingSoftMessageRefresh();
     }
   }
 
@@ -198,7 +543,30 @@
     }
   }
 
-  function render() {
+  function patchPreservedChatHeader(chatEl) {
+    if (!chatEl || !state.selected) return;
+    const strong = chatEl.querySelector(".oc-chat-header strong");
+    if (strong) strong.textContent = state.selected.participant_name || t("empty_chat");
+    const pill = chatEl.querySelector(".oc-chat-header .channel-pill");
+    if (pill) pill.textContent = `${state.selected.provider} · ${state.selected.status}`;
+  }
+
+  function render(options) {
+    const opts = options || {};
+    const chrome = captureUiChrome();
+    let reusedChat = null;
+    let reusedCustomer = null;
+    if (
+      opts.preserveChat &&
+      state.selected &&
+      !state.loadingChat &&
+      root.querySelector(".oc-chat .oc-messages")
+    ) {
+      reusedChat = root.querySelector(".oc-chat");
+      reusedCustomer = root.querySelector(".oc-customer");
+      if (reusedChat) reusedChat.remove();
+      if (reusedCustomer) reusedCustomer.remove();
+    }
     root.innerHTML = "";
     const shell = el("div", { className: "oc-shell", dir: rtl ? "rtl" : "ltr" });
 
@@ -289,172 +657,184 @@
       });
     }
 
-    const chat = el("section", { className: "oc-chat" });
-    chat.appendChild(
-      el("header", { className: "oc-chat-header" }, [
-        el("div", null, [
-          el("strong", { text: (state.selected && state.selected.participant_name) || t("empty_chat") }),
-          state.selected
-            ? el("div", { className: "channel-pill", text: `${state.selected.provider} · ${state.selected.status}` })
-            : null,
-        ]),
-      ])
-    );
-    if (state.error) chat.appendChild(el("div", { className: "oc-error", text: state.error }));
-    if (!state.selected) chat.appendChild(el("div", { className: "oc-empty", text: t("empty_chat") }));
-    else if (state.loadingChat) chat.appendChild(el("div", { className: "oc-empty", text: t("loading") }));
-    else {
-      const msgs = el("div", { className: "oc-messages" });
-      state.messages.forEach((m) => {
-        msgs.appendChild(
-          el("div", { className: "oc-bubble " + (m.direction === "Outbound" ? "outbound" : "inbound") }, [
-            el("div", { text: m.text_content || m.message_type }),
-            el("div", {
-              className: "oc-meta",
-              text: `${fmt(m.sent_at)}${m.direction === "Outbound" ? " · " + m.delivery_status : ""}`,
-            }),
-          ])
-        );
-      });
-      chat.appendChild(msgs);
-    }
-    const composer = el("div", { className: "oc-composer" });
-    const ta = el("textarea", {
-      rows: "3",
-      placeholder: t("composer_placeholder"),
-      value: state.draft,
-      disabled: !state.selected || (state.selected && state.selected.provider !== "Facebook"),
-      oninput: (e) => {
-        state.draft = e.target.value;
-      },
-    });
-    composer.appendChild(ta);
-    composer.appendChild(
-      el("button", {
-        className: "oc-btn",
-        type: "button",
-        text: t("send"),
-        disabled: !state.selected || !state.selected || state.selected.provider !== "Facebook",
-        onclick: sendMessage,
-      })
-    );
-    chat.appendChild(composer);
-    if (state.selected && state.selected.provider !== "Facebook") {
-      chat.appendChild(el("div", { className: "oc-empty", text: t("pending_channel") }));
-    }
-
-    const customer = el("aside", { className: "oc-customer" }, [el("h3", { text: t("customer") })]);
-    if (!state.selected) customer.appendChild(el("div", { className: "oc-empty", text: t("empty_chat") }));
-    else {
-      customer.appendChild(el("div", { html: `<strong>${state.selected.participant_name || ""}</strong>` }));
-      customer.appendChild(
-        el("div", { className: "channel-pill", text: `${state.selected.provider} / ${state.selected.participant_id}` })
-      );
-      customer.appendChild(
-        el("p", null, [
-          el("button", {
-            className: "oc-btn secondary",
-            type: "button",
-            text: t("assign_me"),
-            onclick: async () => {
-              await call("meta_omnichannel.crm_integration.service.assign_conversation", {
-                conversation: state.selected.name,
-                user: boot.user,
-              });
-              await openConversation(state.selected);
-              await loadList();
-            },
-          }),
+    let chat;
+    let customer;
+    if (reusedChat) {
+      chat = reusedChat;
+      patchPreservedChatHeader(chat);
+      customer = reusedCustomer || el("aside", { className: "oc-customer" }, [el("h3", { text: t("customer") })]);
+    } else {
+      chat = el("section", { className: "oc-chat" });
+      chat.appendChild(
+        el("header", { className: "oc-chat-header" }, [
+          el("div", null, [
+            el("strong", { text: (state.selected && state.selected.participant_name) || t("empty_chat") }),
+            state.selected
+              ? el("div", { className: "channel-pill", text: `${state.selected.provider} · ${state.selected.status}` })
+              : null,
+          ]),
         ])
       );
-      const status = el("select", {
-        onchange: async (e) => {
-          await call("meta_omnichannel.crm_integration.service.set_conversation_status", {
-            conversation: state.selected.name,
-            status: e.target.value,
-          });
-          await openConversation(state.selected);
-          await loadList();
-        },
-      });
-      ["Open", "Pending", "Resolved", "Closed"].forEach((s) => {
-        const opt = el("option", { text: s, value: s });
-        if (state.selected.status === s) opt.selected = true;
-        status.appendChild(opt);
-      });
-      customer.appendChild(el("label", { text: t("status") }));
-      customer.appendChild(status);
-      customer.appendChild(
-        el("p", null, [
-          el("button", {
-            className: "oc-btn secondary",
-            type: "button",
-            text: t("create_lead"),
-            onclick: async () => {
-              await call("meta_omnichannel.crm_integration.service.create_lead_from_conversation", {
-                conversation: state.selected.name,
-              });
-              await openConversation(state.selected);
-            },
-          }),
-        ])
-      );
-      if (state.panel && state.panel.lead) {
-        customer.appendChild(
-          el("p", null, [
-            el("a", {
-              href: `/app/crm-lead/${state.panel.lead.name}`,
-              target: "_blank",
-              text: `${t("open_crm_lead")} — ${state.panel.lead.lead_name}`,
-            }),
-          ])
-        );
+      if (state.error) chat.appendChild(el("div", { className: "oc-error", text: state.error }));
+      if (!state.selected) chat.appendChild(el("div", { className: "oc-empty", text: t("empty_chat") }));
+      else if (state.loadingChat) chat.appendChild(el("div", { className: "oc-empty", text: t("loading") }));
+      else {
+        const msgs = el("div", { className: "oc-messages" });
+        state.messages.forEach((m) => {
+          msgs.appendChild(
+            el(
+              "div",
+              { className: "oc-bubble " + (m.direction === "Outbound" ? "outbound" : "inbound") },
+              [
+                ...renderMessageBody(m),
+                el("div", {
+                  className: "oc-meta",
+                  text: `${fmt(m.sent_at)}${m.direction === "Outbound" ? " · " + m.delivery_status : ""}`,
+                }),
+              ]
+            )
+          );
+        });
+        chat.appendChild(msgs);
       }
-      if (state.panel && state.panel.contact) {
-        customer.appendChild(
-          el("p", null, [
-            el("a", {
-              href: `/app/contact/${state.panel.contact.name}`,
-              target: "_blank",
-              text: t("open_contact"),
-            }),
-          ])
-        );
-      }
-      customer.appendChild(el("h3", { text: t("notes") }));
-      const noteTa = el("textarea", {
+      const composer = el("div", { className: "oc-composer" });
+      const ta = el("textarea", {
         rows: "3",
-        value: state.note,
+        placeholder: t("composer_placeholder"),
+        value: state.draft,
+        disabled: !state.selected || (state.selected && state.selected.provider !== "Facebook"),
         oninput: (e) => {
-          state.note = e.target.value;
+          state.draft = e.target.value;
         },
       });
-      customer.appendChild(noteTa);
-      customer.appendChild(
-        el("p", null, [
-          el("button", {
-            className: "oc-btn secondary",
-            type: "button",
-            text: t("add_note"),
-            onclick: async () => {
-              await call("meta_omnichannel.crm_integration.service.add_internal_note", {
-                conversation: state.selected.name,
-                note: state.note,
-              });
-              state.note = "";
-              await openConversation(state.selected);
-            },
-          }),
-        ])
+      composer.appendChild(ta);
+      composer.appendChild(
+        el("button", {
+          className: "oc-btn",
+          type: "button",
+          text: t("send"),
+          disabled: !state.selected || !state.selected || state.selected.provider !== "Facebook",
+          onclick: sendMessage,
+        })
       );
-      (state.panel && state.panel.notes ? state.panel.notes : []).forEach((n) => {
+      chat.appendChild(composer);
+      if (state.selected && state.selected.provider !== "Facebook") {
+        chat.appendChild(el("div", { className: "oc-empty", text: t("pending_channel") }));
+      }
+
+      customer = el("aside", { className: "oc-customer" }, [el("h3", { text: t("customer") })]);
+      if (!state.selected) customer.appendChild(el("div", { className: "oc-empty", text: t("empty_chat") }));
+      else {
+        customer.appendChild(el("div", { html: `<strong>${state.selected.participant_name || ""}</strong>` }));
         customer.appendChild(
-          el("div", { className: "oc-preview" }, [
-            el("div", { text: (n.note || "").replace(/<[^>]+>/g, "") }),
-            el("div", { className: "channel-pill", text: `${n.author} · ${fmt(n.creation)}` }),
+          el("div", { className: "channel-pill", text: `${state.selected.provider} / ${state.selected.participant_id}` })
+        );
+        customer.appendChild(
+          el("p", null, [
+            el("button", {
+              className: "oc-btn secondary",
+              type: "button",
+              text: t("assign_me"),
+              onclick: async () => {
+                await call("meta_omnichannel.crm_integration.service.assign_conversation", {
+                  conversation: state.selected.name,
+                  user: boot.user,
+                });
+                await openConversation(state.selected);
+                await loadList();
+              },
+            }),
           ])
         );
-      });
+        const status = el("select", {
+          onchange: async (e) => {
+            await call("meta_omnichannel.crm_integration.service.set_conversation_status", {
+              conversation: state.selected.name,
+              status: e.target.value,
+            });
+            await openConversation(state.selected);
+            await loadList();
+          },
+        });
+        ["Open", "Pending", "Resolved", "Closed"].forEach((s) => {
+          const opt = el("option", { text: s, value: s });
+          if (state.selected.status === s) opt.selected = true;
+          status.appendChild(opt);
+        });
+        customer.appendChild(el("label", { text: t("status") }));
+        customer.appendChild(status);
+        customer.appendChild(
+          el("p", null, [
+            el("button", {
+              className: "oc-btn secondary",
+              type: "button",
+              text: t("create_lead"),
+              onclick: async () => {
+                await call("meta_omnichannel.crm_integration.service.create_lead_from_conversation", {
+                  conversation: state.selected.name,
+                });
+                await openConversation(state.selected);
+              },
+            }),
+          ])
+        );
+        if (state.panel && state.panel.lead) {
+          customer.appendChild(
+            el("p", null, [
+              el("a", {
+                href: `/app/crm-lead/${state.panel.lead.name}`,
+                target: "_blank",
+                text: `${t("open_crm_lead")} — ${state.panel.lead.lead_name}`,
+              }),
+            ])
+          );
+        }
+        if (state.panel && state.panel.contact) {
+          customer.appendChild(
+            el("p", null, [
+              el("a", {
+                href: `/app/contact/${state.panel.contact.name}`,
+                target: "_blank",
+                text: t("open_contact"),
+              }),
+            ])
+          );
+        }
+        customer.appendChild(el("h3", { text: t("notes") }));
+        const noteTa = el("textarea", {
+          rows: "3",
+          value: state.note,
+          oninput: (e) => {
+            state.note = e.target.value;
+          },
+        });
+        customer.appendChild(noteTa);
+        customer.appendChild(
+          el("p", null, [
+            el("button", {
+              className: "oc-btn secondary",
+              type: "button",
+              text: t("add_note"),
+              onclick: async () => {
+                await call("meta_omnichannel.crm_integration.service.add_internal_note", {
+                  conversation: state.selected.name,
+                  note: state.note,
+                });
+                state.note = "";
+                await openConversation(state.selected);
+              },
+            }),
+          ])
+        );
+        (state.panel && state.panel.notes ? state.panel.notes : []).forEach((n) => {
+          customer.appendChild(
+            el("div", { className: "oc-preview" }, [
+              el("div", { text: (n.note || "").replace(/<[^>]+>/g, "") }),
+              el("div", { className: "channel-pill", text: `${n.author} · ${fmt(n.creation)}` }),
+            ])
+          );
+        });
+      }
     }
 
     shell.appendChild(side);
@@ -462,8 +842,119 @@
     shell.appendChild(chat);
     shell.appendChild(customer);
     root.appendChild(shell);
+    restoreUiChrome(chrome);
   }
+
+  async function flushRealtimeRefresh() {
+    realtimeDebounceTimer = null;
+    const hints = Array.from(pendingRealtimeConversations);
+    pendingRealtimeConversations.clear();
+    const doReconnect = realtimeReconnectBound;
+    realtimeReconnectBound = false;
+    const selectedName = state.selected && state.selected.name;
+    await softLoadList();
+    const refreshMessages =
+      doReconnect || (selectedName && hints.indexOf(selectedName) !== -1);
+    if (
+      refreshMessages &&
+      state.selected &&
+      state.selected.name &&
+      (!selectedName || state.selected.name === selectedName)
+    ) {
+      await softRefreshMessages(state.selected.name);
+    }
+  }
+
+  function scheduleRealtimeRefresh(conversationName, options) {
+    const opts = options || {};
+    if (conversationName) pendingRealtimeConversations.add(conversationName);
+    if (opts.reconnect) realtimeReconnectBound = true;
+    if (realtimeDebounceTimer) clearTimeout(realtimeDebounceTimer);
+    realtimeDebounceTimer = setTimeout(flushRealtimeRefresh, REALTIME_DEBOUNCE_MS);
+  }
+
+  function onConversationUpdated(payload) {
+    const name = validateConversationHint(payload);
+    if (!name) return;
+    scheduleRealtimeRefresh(name);
+  }
+
+  function ensureSocketConnected() {
+    try {
+      const rt = window.frappe && window.frappe.realtime;
+      const socket = rt && rt.socket;
+      if (socket && socket.disconnected && typeof socket.connect === "function") {
+        socket.connect();
+      }
+    } catch (_) {}
+  }
+
+  function onRealtimeSocketConnect() {
+    // One soft refresh after reconnect — coalesced; no polling loop.
+    scheduleRealtimeRefresh(state.selected && state.selected.name, { reconnect: true });
+  }
+
+  function subscribeRealtimeOnce() {
+    if (realtimeSubscribed) return false;
+    const rt = window.frappe && window.frappe.realtime;
+    if (!rt || typeof rt.on !== "function") return false;
+    realtimeSubscribed = true;
+    ensureSocketConnected();
+    rt.on(REALTIME_EVENT, onConversationUpdated);
+    try {
+      const socket = rt.socket;
+      if (socket && typeof socket.on === "function") {
+        socket.on("connect", onRealtimeSocketConnect);
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  // Diagnostics surface: read-only introspection + real function refs for tests.
+  // Test-only state mutators are injected by the Node harness, not shipped here.
+  window.__omnichannelRealtime = {
+    eventName: REALTIME_EVENT,
+    debounceMs: REALTIME_DEBOUNCE_MS,
+    validateConversationHint: validateConversationHint,
+    isPermissionError: isPermissionError,
+    scheduleRealtimeRefresh: scheduleRealtimeRefresh,
+    onConversationUpdated: onConversationUpdated,
+    subscribeRealtimeOnce: subscribeRealtimeOnce,
+    softRefreshMessages: softRefreshMessages,
+    softLoadList: softLoadList,
+    openConversation: openConversation,
+    drainPendingSoftMessageRefresh: drainPendingSoftMessageRefresh,
+    getPendingSoftMessageRefresh: function () {
+      return pendingSoftMessageRefresh;
+    },
+    getOpenConversationSeq: function () {
+      return openConversationSeq;
+    },
+    getState: function () {
+      return {
+        selected: state.selected && state.selected.name,
+        loadingChat: state.loadingChat,
+        draft: state.draft,
+        note: state.note,
+        search: state.search,
+        filter: state.filter,
+        messageCount: state.messages.length,
+        conversationCount: state.conversations.length,
+        panel: state.panel,
+      };
+    },
+    isSubscribed: function () {
+      return realtimeSubscribed;
+    },
+    pendingCount: function () {
+      return pendingRealtimeConversations.size;
+    },
+    isSoftListRunning: function () {
+      return softListRunning;
+    },
+  };
 
   render();
   loadList();
+  subscribeRealtimeOnce();
 })();
