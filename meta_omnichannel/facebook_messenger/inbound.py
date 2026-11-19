@@ -414,5 +414,5 @@ def process_facebook_inbound_notification(*, body: bytes) -> dict[str, Any]:
 		"queued": True,
 		"conversation": conversation,
 		"notification_id": notification_id,
-		"job": job,
+		"job": job.id if job is not None else None,
 	}
