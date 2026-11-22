@@ -411,6 +411,8 @@
   let listRefreshGen = 0;
   let messagesRefreshGen = 0;
   let openConversationSeq = 0;
+  /** When true, the next non-loading messages render scrolls to the latest message. */
+  let pendingScrollToLatest = false;
   let softListRunning = false;
   let softListWanted = false;
   let softListDone = null;
@@ -481,8 +483,15 @@
     if (!chrome) return;
     const msgs = root.querySelector(".oc-messages");
     if (msgs) {
-      if (chrome.nearBottom) msgs.scrollTop = msgs.scrollHeight;
-      else msgs.scrollTop = chrome.scrollTop;
+      // Opening a conversation always lands on the latest message.
+      // Soft refreshes keep prior position unless the user was near the bottom.
+      if (pendingScrollToLatest && !state.loadingChat) {
+        msgs.scrollTop = msgs.scrollHeight;
+        pendingScrollToLatest = false;
+      } else if (!pendingScrollToLatest) {
+        if (chrome.nearBottom) msgs.scrollTop = msgs.scrollHeight;
+        else msgs.scrollTop = chrome.scrollTop;
+      }
     }
     restoreFocusedField(".oc-composer textarea", chrome.composer);
     restoreFocusedField(".oc-list-toolbar input[type='search']", chrome.search);
@@ -643,6 +652,7 @@
     state.note = "";
     state.loadingChat = false;
     pendingSoftMessageRefresh = null;
+    pendingScrollToLatest = false;
     state.error = t("empty_chat");
     messagesRefreshGen += 1;
     openConversationSeq += 1;
@@ -711,6 +721,7 @@
     state.selected = row;
     state.loadingChat = true;
     state.error = "";
+    pendingScrollToLatest = true;
     messagesRefreshGen += 1;
     const openGen = messagesRefreshGen;
     render();
@@ -901,11 +912,12 @@
       })
     );
     list.appendChild(toolbar);
-    if (state.loadingList) list.appendChild(el("div", { className: "oc-empty", text: t("loading") }));
-    else if (!state.conversations.length) list.appendChild(el("div", { className: "oc-empty", text: t("empty_list") }));
+    const listItems = el("div", { className: "oc-list-items" });
+    if (state.loadingList) listItems.appendChild(el("div", { className: "oc-empty", text: t("loading") }));
+    else if (!state.conversations.length) listItems.appendChild(el("div", { className: "oc-empty", text: t("empty_list") }));
     else {
       state.conversations.forEach((c) => {
-        list.appendChild(
+        listItems.appendChild(
           el(
             "button",
             {
@@ -925,6 +937,7 @@
         );
       });
     }
+    list.appendChild(listItems);
 
     let chat;
     let customer;

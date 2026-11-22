@@ -14,29 +14,53 @@
   --oc-font: "IBM Plex Sans", "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; }
-html, body, #omnichannel-app, .oc-shell { height: 100%; margin: 0; }
+html, body, #omnichannel-app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
 body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-bg); }
 .oc-shell {
   display: grid;
   grid-template-columns: 220px minmax(280px, 360px) minmax(0, 1fr) 300px;
-  min-height: 100vh;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
   background: linear-gradient(160deg, #edf2f7 0%, #f7fafc 45%, #eef6f3 100%);
+}
+@supports (height: 100dvh) {
+  .oc-shell { height: 100dvh; max-height: 100dvh; }
 }
 .oc-side, .oc-list, .oc-chat, .oc-customer {
   background: var(--oc-panel);
   border-inline-end: 1px solid var(--oc-line);
-  min-height: 100vh;
+  min-height: 0;
   min-width: 0;
+  height: 100%;
+  overflow: hidden;
 }
-.oc-side { background: var(--oc-sidebar); color: var(--oc-sidebar-ink); padding: 1.25rem 0.85rem; }
+.oc-side {
+  background: var(--oc-sidebar); color: var(--oc-sidebar-ink); padding: 1.25rem 0.85rem;
+  overflow-y: auto;
+}
 .oc-brand { font-size: 1.15rem; font-weight: 700; margin: 0 0 1.25rem; }
 .oc-nav button {
   width: 100%; text-align: start; border: 0; background: transparent; color: inherit;
   padding: 0.65rem 0.75rem; border-radius: 10px; cursor: pointer; margin-bottom: 0.25rem;
 }
 .oc-nav button.active, .oc-nav button:hover { background: rgba(255,255,255,.1); }
-.oc-list { display: flex; flex-direction: column; overflow: auto; }
-.oc-list-toolbar { padding: 1rem; border-bottom: 1px solid var(--oc-line); display: grid; gap: .6rem; }
+.oc-list { display: flex; flex-direction: column; overflow: hidden; }
+.oc-list-toolbar {
+  padding: 1rem; border-bottom: 1px solid var(--oc-line); display: grid; gap: .6rem;
+  flex: 0 0 auto;
+}
+.oc-list-items {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
 .oc-list-toolbar input, .oc-composer textarea, .oc-customer select, .oc-customer textarea {
   width: 100%; border: 1px solid var(--oc-line); border-radius: 10px; padding: .65rem .75rem; font: inherit;
 }
@@ -57,11 +81,18 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   display: inline-flex; min-width: 1.25rem; justify-content: center; border-radius: 999px;
   background: var(--oc-accent); color: #fff; font-size: .75rem; padding: 0 .35rem;
 }
-.oc-chat { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+.oc-chat {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
 .oc-chat-header {
   padding: 1rem 1.25rem; border-bottom: 1px solid var(--oc-line);
   display: flex; justify-content: space-between; align-items: center; gap: 1rem;
   min-width: 0;
+  flex-shrink: 0;
 }
 .oc-chat-title { min-width: 0; }
 .oc-chat-title-primary {
@@ -73,8 +104,12 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .oc-messages {
-  padding: 1.25rem; overflow: auto; display: flex; flex-direction: column; gap: .75rem;
+  padding: 1.25rem;
+  display: flex; flex-direction: column; gap: .75rem;
   min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .oc-bubble {
   max-width: min(72%, 520px); padding: .75rem .9rem; border-radius: 16px; line-height: 1.45;
@@ -136,8 +171,15 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
 .oc-composer {
   border-top: 1px solid var(--oc-line); padding: .9rem 1rem;
   display: grid; grid-template-columns: 1fr auto; gap: .75rem; align-items: end;
+  flex-shrink: 0;
+  min-width: 0;
 }
-.oc-customer { padding: 1rem; border-inline-end: 0; overflow: auto; }
+.oc-customer {
+  padding: 1rem; border-inline-end: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  min-height: 0;
+}
 .oc-customer h3 { margin: 0 0 .75rem; }
 .oc-customer section { margin-bottom: 1.25rem; }
 .oc-empty, .oc-error, .omnichannel-boot { padding: 2rem 1rem; color: var(--oc-muted); text-align: center; }
@@ -148,6 +190,22 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   .oc-customer { display: none; }
 }
 @media (max-width: 760px) {
-  .oc-shell { grid-template-columns: 1fr; }
-  .oc-side, .oc-list, .oc-chat { min-height: auto; }
+  html, body, #omnichannel-app { overflow: auto; height: auto; min-height: 100%; }
+  .oc-shell {
+    grid-template-columns: 1fr;
+    height: auto;
+    max-height: none;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+  .oc-side, .oc-list {
+    height: auto;
+    max-height: 42vh;
+    overflow: hidden;
+  }
+  .oc-list-items { max-height: none; }
+  .oc-chat {
+    height: min(70vh, 640px);
+    min-height: 280px;
+  }
 }

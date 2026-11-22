@@ -90,7 +90,12 @@ def capture_ui_chrome(
 	)
 
 
-def restore_scroll(chrome: UiChrome, *, scroll_height: float) -> float:
+def restore_scroll(
+	chrome: UiChrome, *, scroll_height: float, force_to_latest: bool = False
+) -> float:
+	"""Mirror restoreUiChrome message scroll rules in omnichannel.js."""
+	if force_to_latest:
+		return scroll_height
 	if chrome.near_bottom:
 		return scroll_height
 	return chrome.scroll_top
@@ -446,6 +451,32 @@ class TestAttachmentRenderingSource(unittest.TestCase):
 		self.assertIn("max-width: 100%", vue_css)
 		self.assertIn("max-height: 320px", vue_css)
 
+	def test_css_viewport_bounded_independent_scroll(self):
+		"""Inbox shell stays viewport-bound; messages + list scroll inside columns."""
+		css = PLAIN_CSS.read_text(encoding="utf-8")
+		# Page shell must not grow with message history.
+		self.assertIn("overflow: hidden", css)
+		self.assertRegex(css, r"\.oc-shell\s*\{[^}]*height:\s*100%")
+		self.assertRegex(css, r"\.oc-shell\s*\{[^}]*overflow:\s*hidden")
+		self.assertRegex(
+			css,
+			r"\.oc-side,\s*\.oc-list,\s*\.oc-chat,\s*\.oc-customer\s*\{[^}]*min-height:\s*0",
+		)
+		# Chat column: header | scrollable messages | composer.
+		self.assertIn("grid-template-rows: auto minmax(0, 1fr) auto", css)
+		msgs_block = css[css.index(".oc-messages") : css.index(".oc-bubble")]
+		self.assertIn("min-height: 0", msgs_block)
+		self.assertIn("overflow-y: auto", msgs_block)
+		# Conversation list scrolls independently of the toolbar.
+		self.assertIn(".oc-list-items", css)
+		list_items = css[css.index(".oc-list-items") : css.index(".oc-list-toolbar input")]
+		self.assertIn("min-height: 0", list_items)
+		self.assertIn("overflow-y: auto", list_items)
+		# Mobile still allows page flow while chat keeps a bounded height.
+		mobile = css[css.index("@media (max-width: 760px)") :]
+		self.assertIn("overflow: auto", mobile)
+		self.assertIn("height: min(70vh, 640px)", mobile)
+
 
 class TestRealtimeSoftRefreshContract(unittest.TestCase):
 	"""Executable soft-refresh behavior (no browser). Wiring checks are separate."""
@@ -528,6 +559,13 @@ class TestRealtimeSoftRefreshContract(unittest.TestCase):
 		)
 		self.assertTrue(near.near_bottom)
 		self.assertEqual(restore_scroll(near, scroll_height=700), 700)
+
+		# Opening a different conversation always jumps to latest, even if chrome
+		# still remembers a mid-thread reading position from the prior thread.
+		self.assertEqual(
+			restore_scroll(chrome, scroll_height=900, force_to_latest=True),
+			900,
+		)
 
 		inbox = SoftRefreshInbox(selected="CONV-1", draft="keep me")
 		inbox.messages_provider = lambda _c: [{"name": "m"}]
@@ -648,6 +686,16 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("chrome.nearBottom", js)
 		self.assertIn("preserveChat: true", js)
 		self.assertIn("openConversationSeq", js)
+		# Open → latest; soft refresh reuses nearBottom / scrollTop (no duplicate scrollers).
+		self.assertIn("pendingScrollToLatest", js)
+		self.assertIn("pendingScrollToLatest = true", js)
+		self.assertIn('className: "oc-list-items"', js)
+		restore_fn = js[
+			js.index("function restoreUiChrome") : js.index("function el(")
+		]
+		self.assertIn("pendingScrollToLatest && !state.loadingChat", restore_fn)
+		self.assertIn("chrome.nearBottom", restore_fn)
+		self.assertIn("chrome.scrollTop", restore_fn)
 
 	def test_debounce_window_is_within_required_band(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
@@ -1311,6 +1359,98 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "scroll_open_and_soft_refresh") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const openP = api.openConversation(row);
+    await waitUntil(() => gate.messages.length >= 1, "open messages");
+    gate.messages[0].d.resolve([
+      { name: "m1", direction: "Inbound", message_type: "Text", text_content: "one", sent_at: "1" },
+      { name: "m2", direction: "Inbound", message_type: "Text", text_content: "two", sent_at: "2" },
+    ]);
+    await waitUntil(() => gate.panel.length >= 1, "panel");
+    gate.panel[0].d.resolve({ lead: null, notes: [] });
+    await openP;
+    assert.ok(root.querySelector(".oc-list-items"), "conversation list scroll container");
+    assert.ok(root.querySelector(".oc-chat-header"), "chat header present");
+    assert.ok(root.querySelector(".oc-composer"), "composer present");
+    let msgs = root.querySelector(".oc-messages");
+    assert.ok(msgs, "messages pane");
+    assert.strictEqual(
+      msgs.scrollTop,
+      msgs.scrollHeight,
+      "open conversation scrolls to latest"
+    );
+
+    // Reading older messages: soft refresh must preserve scrollTop.
+    msgs.scrollHeight = 800;
+    msgs.clientHeight = 200;
+    msgs.scrollTop = 40;
+    const softAway = api.softRefreshMessages("CONV-A");
+    await waitUntil(() => gate.messages.length >= 2, "soft away from bottom");
+    gate.messages[gate.messages.length - 1].d.resolve([
+      { name: "m1", direction: "Inbound", message_type: "Text", text_content: "one", sent_at: "1" },
+      { name: "m2", direction: "Inbound", message_type: "Text", text_content: "two", sent_at: "2" },
+      { name: "m3", direction: "Inbound", message_type: "Text", text_content: "three", sent_at: "3" },
+    ]);
+    await softAway;
+    msgs = root.querySelector(".oc-messages");
+    assert.strictEqual(msgs.scrollTop, 40, "soft refresh preserves reading position");
+
+    // Near bottom: soft refresh should follow the tip.
+    msgs.scrollHeight = 800;
+    msgs.clientHeight = 200;
+    msgs.scrollTop = 740;
+    const softNear = api.softRefreshMessages("CONV-A");
+    await waitUntil(() => gate.messages.length >= 3, "soft near bottom");
+    gate.messages[gate.messages.length - 1].d.resolve([
+      { name: "m1", direction: "Inbound", message_type: "Text", text_content: "one", sent_at: "1" },
+      { name: "m2", direction: "Inbound", message_type: "Text", text_content: "two", sent_at: "2" },
+      { name: "m3", direction: "Inbound", message_type: "Text", text_content: "three", sent_at: "3" },
+      { name: "m4", direction: "Inbound", message_type: "Text", text_content: "four", sent_at: "4" },
+    ]);
+    await softNear;
+    msgs = root.querySelector(".oc-messages");
+    assert.strictEqual(
+      msgs.scrollTop,
+      msgs.scrollHeight,
+      "near-bottom soft refresh follows latest"
+    );
+
+    // Switching conversations must jump to latest even if prior thread was scrolled up.
+    msgs.scrollHeight = 800;
+    msgs.clientHeight = 200;
+    msgs.scrollTop = 50;
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length >= 4, "open B messages");
+    gate.messages[gate.messages.length - 1].d.resolve([
+      { name: "b1", direction: "Inbound", message_type: "Text", text_content: "b", sent_at: "1" },
+    ]);
+    await waitUntil(() => gate.panel.length >= 2, "panel B");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    msgs = root.querySelector(".oc-messages");
+    assert.strictEqual(
+      msgs.scrollTop,
+      msgs.scrollHeight,
+      "opening another conversation scrolls to latest"
+    );
+    console.log("OK scroll_open_and_soft_refresh");
+    return;
+  }
+
   if (scenario === "open_gen_invalidate_clears_loading") {
     const row = {
       name: "CONV-A",
@@ -1414,6 +1554,10 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_messages_gen_invalidate_during_open_clears_loading(self):
 		out = self._run_scenario("open_gen_invalidate_clears_loading")
 		self.assertIn("OK open_gen_invalidate_clears_loading", out)
+
+	def test_scroll_open_and_soft_refresh(self):
+		out = self._run_scenario("scroll_open_and_soft_refresh")
+		self.assertIn("OK scroll_open_and_soft_refresh", out)
 
 	def test_subscribe_waits_for_lazy_socket(self):
 		out = self._run_scenario("subscribe_waits_for_socket")
