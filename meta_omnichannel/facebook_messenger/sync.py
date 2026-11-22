@@ -156,13 +156,35 @@ def build_message_dedup_fingerprint(
 
 
 def _ensure_facebook_channel(page_id: str, page_name: str | None = None) -> str:
+	"""Return Omnichannel Channel for ``page_id``, creating or renaming as needed.
+
+	When the channel already exists and ``page_name`` is a non-empty string, update
+	``channel_name`` / ``external_account_name`` only if they differ. Blank
+	``page_name`` leaves existing names unchanged. Document name (ID), Page ID,
+	and linked conversations/messages are never rewritten.
+	"""
 	existing = frappe.db.get_value(
 		"Omnichannel Channel",
 		{"provider": PROVIDER, "external_account_id": page_id},
-		"name",
+		["name", "channel_name", "external_account_name"],
+		as_dict=True,
 	)
 	if existing:
-		return existing
+		cleaned = str(page_name or "").strip()
+		if cleaned:
+			patch: dict[str, Any] = {}
+			if (existing.channel_name or "") != cleaned:
+				patch["channel_name"] = cleaned
+			if (existing.external_account_name or "") != cleaned:
+				patch["external_account_name"] = cleaned
+			if patch:
+				frappe.db.set_value(
+					"Omnichannel Channel",
+					existing.name,
+					patch,
+					update_modified=False,
+				)
+		return existing.name
 	doc = frappe.get_doc(
 		{
 			"doctype": "Omnichannel Channel",
