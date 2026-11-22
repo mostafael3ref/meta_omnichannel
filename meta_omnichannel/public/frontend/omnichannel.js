@@ -35,6 +35,7 @@
       attachment_unavailable: "Attachment unavailable",
       close_lightbox: "Close",
       download_attachment: "Download",
+      page_id_label: "Page ID",
     },
     ar: {
       inbox: "الوارد",
@@ -65,6 +66,7 @@
       attachment_unavailable: "المرفق غير متاح",
       close_lightbox: "إغلاق",
       download_attachment: "تنزيل",
+      page_id_label: "معرف الصفحة",
     },
   };
   const t = (k) => (rtl ? i18n.ar : i18n.en)[k] || i18n.en[k] || k;
@@ -536,11 +538,21 @@
     return String((c && c.page_id) || "").trim();
   }
 
+  /** Facebook: page_name primary; other providers: participant. */
+  function conversationPrimaryTitle(c) {
+    if (!c) return t("empty_chat");
+    if (String(c.provider || "") === "Facebook") {
+      const pageName = conversationPageName(c);
+      if (pageName) return pageName;
+    }
+    return String(c.participant_name || c.participant_id || "").trim() || t("empty_chat");
+  }
+
   function buildChatHeaderTitle(selected) {
     const children = [
       el("strong", {
-        className: "oc-chat-participant",
-        text: (selected && selected.participant_name) || t("empty_chat"),
+        className: "oc-chat-title-primary",
+        text: conversationPrimaryTitle(selected),
       }),
     ];
     if (selected) {
@@ -550,13 +562,17 @@
           text: `${selected.provider} · ${selected.status}`,
         })
       );
-      const pageName = conversationPageName(selected);
-      if (pageName) {
-        children.push(el("div", { className: "oc-chat-page-name", text: pageName }));
-      }
-      const pageId = conversationPageId(selected);
-      if (pageId) {
-        children.push(el("div", { className: "oc-chat-page-id", text: pageId }));
+      // Facebook only: one compact Page ID line (never duplicate page_name).
+      if (String(selected.provider || "") === "Facebook") {
+        const pageId = conversationPageId(selected);
+        if (pageId) {
+          children.push(
+            el("div", {
+              className: "oc-chat-page-id",
+              text: `${t("page_id_label")}: ${pageId}`,
+            })
+          );
+        }
       }
     }
     return el("div", { className: "oc-chat-title" }, children);
@@ -893,7 +909,7 @@
             },
             [
               el("div", { className: "oc-conv-top" }, [
-                el("span", { text: c.participant_name || c.participant_id }),
+                el("span", { text: conversationPrimaryTitle(c) }),
                 c.unread_count ? el("span", { className: "oc-badge", text: String(c.unread_count) }) : null,
               ]),
               el("div", { className: "channel-pill", text: `${c.provider} · ${fmt(c.last_message_at)}` }),

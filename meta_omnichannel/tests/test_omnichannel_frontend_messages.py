@@ -220,18 +220,31 @@ class TestDeployedFrontendIsPlainBundle(unittest.TestCase):
 		self.assertIn("no-build fallback", js)
 		self.assertNotIn("createApp", js)
 
-	def test_plain_js_chat_header_shows_page_name_and_id(self):
+	def test_plain_js_facebook_page_name_layout(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
 		css = PLAIN_CSS.read_text(encoding="utf-8")
+		self.assertIn("function conversationPrimaryTitle", js)
 		self.assertIn("function buildChatHeaderTitle", js)
-		self.assertIn("oc-chat-page-name", js)
+		self.assertIn('provider || "") === "Facebook"', js)
+		self.assertIn("conversationPrimaryTitle(c)", js)
+		self.assertIn("conversationPrimaryTitle(selected)", js)
+		self.assertIn("page_id_label", js)
 		self.assertIn("oc-chat-page-id", js)
-		self.assertIn("page_name", js)
+		self.assertIn("oc-chat-title-primary", js)
+		# Page name is the primary title — not a second label.
+		self.assertNotIn("oc-chat-page-name", js)
+		self.assertNotIn(".oc-chat-page-name", css)
 		self.assertIn("patchPreservedChatHeader", js)
-		self.assertIn("mergeSelectedFromList", js)
 		self.assertIn("fresh.page_name", js)
-		self.assertIn(".oc-chat-page-name", css)
 		self.assertIn(".oc-chat-page-id", css)
+		# Header must not also paint participant_name when page_name is used.
+		header_fn = js[
+			js.index("function buildChatHeaderTitle") : js.index("async function loadList")
+		]
+		self.assertNotIn("selected.participant_name", header_fn)
+		self.assertIn("conversationPrimaryTitle(selected)", header_fn)
+		# List uses the same primary-title helper (one title row).
+		self.assertIn("conversationPrimaryTitle(c)", js)
 
 
 class TestFrappeCallDoesNotDropMessageOnServerMessages(unittest.TestCase):
