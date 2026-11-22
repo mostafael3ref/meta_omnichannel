@@ -48,4 +48,5 @@ permission_query_conditions = {
 
 has_permission = {
 	"Omnichannel Conversation": "meta_omnichannel.permissions.has_conversation_permission",
+	"Omnichannel Message": "meta_omnichannel.permissions.has_message_permission",
 }

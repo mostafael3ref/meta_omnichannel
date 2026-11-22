@@ -53,7 +53,10 @@ def message_query(user: str | None = None) -> str:
 	)
 
 
-def has_conversation_permission(doc, ptype: str, user: str | None = None) -> bool:
+def has_conversation_permission(
+	doc, ptype: str, user: str | None = None, debug: bool = False
+) -> bool:
+	# ``debug`` accepted for Frappe v15 has_permission hook kwargs; unused.
 	user = user or frappe.session.user
 	if user_is_omnichannel_admin(user):
 		return True
@@ -63,3 +66,49 @@ def has_conversation_permission(doc, ptype: str, user: str | None = None) -> boo
 	if not assigned or assigned == user:
 		return True
 	return False
+
+
+def has_message_permission(
+	doc, ptype: str, user: str | None = None, debug: bool = False
+) -> bool:
+	"""Conversation-scoped access for Omnichannel Message documents.
+
+	Resolves the parent conversation and reuses :func:`has_conversation_permission`
+	so assignment rules stay in one place. Missing/invalid conversation links deny
+	access.
+
+	Frappe ``has_permission`` hooks only **deny** (return ``False``); returning
+	``True`` does not grant rights beyond DocType role permissions. This helper
+	therefore scopes which messages a user may touch but does not invent
+	create/write/delete — those still require the Omnichannel Message role table.
+	Does not call ``frappe.has_permission`` on the conversation (avoids hook recursion).
+	"""
+	user = user or frappe.session.user
+	conversation_name = ""
+	if hasattr(doc, "get"):
+		conversation_name = str(doc.get("conversation") or "").strip()
+	elif getattr(doc, "conversation", None):
+		conversation_name = str(doc.conversation).strip()
+	if not conversation_name:
+		return False
+
+	# Permission-free lookup — never frappe.has_permission / get_doc permission path.
+	conversation = frappe.db.get_value(
+		"Omnichannel Conversation",
+		conversation_name,
+		["name", "assigned_to"],
+		as_dict=True,
+	)
+	if not conversation:
+		return False
+
+	# Normalize to a mapping with ``.get`` so has_conversation_permission works for
+	# both frappe._dict rows and plain attribute objects (no duplicated rules).
+	if hasattr(conversation, "get"):
+		conv_doc = conversation
+	else:
+		conv_doc = {
+			"name": getattr(conversation, "name", None),
+			"assigned_to": getattr(conversation, "assigned_to", None),
+		}
+	return has_conversation_permission(conv_doc, ptype, user=user, debug=debug)
