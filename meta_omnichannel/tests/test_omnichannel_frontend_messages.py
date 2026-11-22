@@ -520,6 +520,8 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("list_messages", soft)
 		self.assertNotIn("get_customer_panel", soft)
 		self.assertNotIn("openConversation(", soft)
+		self.assertNotIn("mark_conversation_read", soft)
+		self.assertNotIn("unread_count = 0", soft)
 		self.assertIn("isPermissionError", soft)
 		self.assertIn("clearInaccessibleConversation", soft)
 		self.assertIn("pendingSoftMessageRefresh", soft)

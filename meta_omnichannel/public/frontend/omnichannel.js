@@ -349,6 +349,7 @@
       provider: fresh.provider,
       status: fresh.status,
       last_message_at: fresh.last_message_at,
+      last_inbound_at: fresh.last_inbound_at,
       last_message_preview: fresh.last_message_preview,
       unread_count: fresh.unread_count,
     });
@@ -456,7 +457,13 @@
       if (gen !== messagesRefreshGen) return;
       if (!state.selected || state.selected.name !== selectedName) return;
       state.messages = (msgData && msgData.items) || [];
-      state.selected.unread_count = 0;
+      // Soft realtime refresh must never mark read / zero unread.
+      if (msgData && msgData.conversation) {
+        const c = msgData.conversation;
+        if (c.unread_count != null) state.selected.unread_count = c.unread_count;
+        if (c.last_inbound_at != null) state.selected.last_inbound_at = c.last_inbound_at;
+        if (c.last_message_at != null) state.selected.last_message_at = c.last_message_at;
+      }
       render();
     } catch (e) {
       if (gen !== messagesRefreshGen) return;
@@ -472,6 +479,10 @@
 
   async function openConversation(row) {
     const seq = ++openConversationSeq;
+    // Open-time read watermark: prefer inbound/list tip; wall-clock fallback so
+    // mark_conversation_read always gets a race-safe as_of (never omit).
+    const asOf =
+      row.last_inbound_at || row.last_message_at || new Date().toISOString();
     state.selected = row;
     state.loadingChat = true;
     state.error = "";
@@ -492,7 +503,26 @@
         if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
         if (!state.selected || state.selected.name !== row.name) return;
         state.messages = (msgData && msgData.items) || [];
-        row.unread_count = 0;
+        // Explicit open/read only — never from soft refresh or pagination.
+        try {
+          const readData = await call(
+            "meta_omnichannel.api.inbox.mark_conversation_read",
+            { conversation: row.name, as_of: asOf }
+          );
+          if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
+          if (!state.selected || state.selected.name !== row.name) return;
+          const unread =
+            readData && readData.unread_count != null ? readData.unread_count : 0;
+          row.unread_count = unread;
+          state.selected.unread_count = unread;
+        } catch (readErr) {
+          if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
+          if (!state.selected || state.selected.name !== row.name) return;
+          if (isPermissionError(readErr)) {
+            clearInaccessibleConversation();
+            return;
+          }
+        }
       } catch (e) {
         if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
         if (!state.selected || state.selected.name !== row.name) return;

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
+
 import frappe
 from frappe import _
 from frappe.utils import cint
@@ -11,6 +14,7 @@ from meta_omnichannel.permissions import (
 	has_conversation_permission,
 	user_is_omnichannel_admin,
 )
+from meta_omnichannel.utils.datetimes import parse_connector_datetime_for_db
 
 
 def _serialize_conversation(row) -> dict:
@@ -25,10 +29,20 @@ def _serialize_conversation(row) -> dict:
 		"unread_count": cint(row.unread_count),
 		"last_message_at": row.last_message_at,
 		"last_message_preview": row.last_message_preview,
+		"last_inbound_at": row.last_inbound_at,
 		"crm_contact": row.crm_contact,
 		"crm_lead": row.crm_lead,
 		"page_id": row.page_id,
 	}
+
+
+def _parse_read_watermark(value: Any) -> datetime | None:
+	"""Normalize a client open-time read watermark to a naive datetime."""
+	if value is None or value == "":
+		return None
+	if isinstance(value, datetime):
+		return value.replace(tzinfo=None) if value.tzinfo is not None else value
+	return parse_connector_datetime_for_db(value)
 
 
 @frappe.whitelist()
@@ -87,6 +101,7 @@ def list_conversations(
 			"unread_count",
 			"last_message_at",
 			"last_message_preview",
+			"last_inbound_at",
 			"crm_contact",
 			"crm_lead",
 			"page_id",
@@ -146,9 +161,7 @@ def list_messages(conversation: str, limit: int = 50, offset: int = 0) -> dict:
 		limit_start=offset,
 	)
 	total = frappe.db.count("Omnichannel Message", {"conversation": conversation})
-	# Clear unread when opening
-	if cint(conv.unread_count):
-		frappe.db.set_value("Omnichannel Conversation", conversation, "unread_count", 0)
+	# Fetch only — never clear unread here (open / soft-refresh / pagination share this).
 
 	return {
 		"items": rows,
@@ -158,6 +171,62 @@ def list_messages(conversation: str, limit: int = 50, offset: int = 0) -> dict:
 		"has_more": offset + len(rows) < total,
 		"next_offset": offset + len(rows) if offset + len(rows) < total else None,
 		"conversation": _serialize_conversation(conv),
+	}
+
+
+@frappe.whitelist()
+def mark_conversation_read(conversation: str, as_of: str | None = None) -> dict:
+	"""Mark a conversation read using a required open-time watermark.
+
+	``unread_count`` is recomputed as the number of inbound non-note messages
+	with ``sent_at`` strictly after ``as_of``. A delayed request therefore cannot
+	erase tips that arrived after the agent opened the conversation.
+
+	Missing or invalid ``as_of`` is a no-op (returns the current unread count).
+	Unconditional clear-to-zero would be race-unsafe under delayed requests.
+	"""
+	ensure_omnichannel_agent()
+	conv = frappe.get_doc("Omnichannel Conversation", conversation)
+	if not has_conversation_permission(conv, "read"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	as_of_dt = _parse_read_watermark(as_of)
+	if as_of_dt is None:
+		unread = cint(
+			frappe.db.get_value("Omnichannel Conversation", conversation, "unread_count")
+		)
+		return {
+			"ok": True,
+			"conversation": conversation,
+			"unread_count": unread,
+			"updated": False,
+		}
+
+	frappe.db.sql(
+		"""
+		UPDATE `tabOmnichannel Conversation` AS c
+		SET c.unread_count = (
+			SELECT COUNT(*)
+			FROM `tabOmnichannel Message` AS m
+			WHERE m.conversation = c.name
+			  AND m.direction = 'Inbound'
+			  AND IFNULL(m.is_internal_note, 0) = 0
+			  AND m.sent_at IS NOT NULL
+			  AND m.sent_at > %(as_of)s
+		)
+		WHERE c.name = %(name)s
+		""",
+		{"name": conversation, "as_of": as_of_dt},
+	)
+
+	unread = cint(
+		frappe.db.get_value("Omnichannel Conversation", conversation, "unread_count")
+	)
+	return {
+		"ok": True,
+		"conversation": conversation,
+		"unread_count": unread,
+		"updated": True,
 	}
 
 

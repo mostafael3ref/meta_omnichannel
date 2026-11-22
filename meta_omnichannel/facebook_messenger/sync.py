@@ -334,7 +334,67 @@ def _maybe_repair_null_sent_at(message_name: str, current_sent_at: Any, raw_time
 	)
 
 
-def upsert_message_from_connector(conversation: str, channel: str, row: dict[str, Any]) -> str | None:
+def _advance_last_inbound_at(conversation: str, candidate: datetime) -> None:
+	"""Monotonic SQL advance of ``last_inbound_at`` (never moves backwards)."""
+	frappe.db.sql(
+		"""
+		UPDATE `tabOmnichannel Conversation`
+		SET last_inbound_at = %(ts)s
+		WHERE name = %(name)s
+		  AND (last_inbound_at IS NULL OR last_inbound_at < %(ts)s)
+		""",
+		{"name": conversation, "ts": candidate},
+	)
+
+
+def _increment_unread_count(conversation: str) -> None:
+	"""Atomic unread bump (safe under concurrent tip inserts)."""
+	frappe.db.sql(
+		"""
+		UPDATE `tabOmnichannel Conversation`
+		SET unread_count = IFNULL(unread_count, 0) + 1
+		WHERE name = %(name)s
+		""",
+		{"name": conversation},
+	)
+
+
+def _apply_inbound_conversation_metadata(
+	conversation: str,
+	*,
+	raw_timestamp: Any,
+	count_unread: bool,
+	unread_watermark: datetime | None,
+) -> None:
+	"""Update ``last_inbound_at`` / unread after a newly inserted inbound message.
+
+	Uses valid connector timestamps only — never the missing→``now`` fallback used
+	for message ``sent_at``. Unread increments require a pre-sync watermark and a
+	strictly newer connector time (see ``sync_conversation_messages``).
+
+	Limitation: the first sync of an empty thread (initial import) never
+	increments unread, even when the same job also pulls a live tip plus older
+	history pages. Live tips on already-synced threads still increment when newer
+	than the pre-sync watermark. Historical backfill pages are not counted.
+	"""
+	if not connector_timestamp_is_present(raw_timestamp):
+		return
+	parsed = parse_connector_datetime_for_db(raw_timestamp)
+	if parsed is None:
+		return
+	_advance_last_inbound_at(conversation, parsed)
+	if count_unread and unread_watermark is not None and parsed > unread_watermark:
+		_increment_unread_count(conversation)
+
+
+def upsert_message_from_connector(
+	conversation: str,
+	channel: str,
+	row: dict[str, Any],
+	*,
+	count_unread: bool = False,
+	unread_watermark: datetime | None = None,
+) -> str | None:
 	external_id = str(
 		row.get("id") or row.get("message_id") or row.get("mid") or row.get("external_message_id") or ""
 	).strip()
@@ -408,6 +468,13 @@ def upsert_message_from_connector(conversation: str, channel: str, row: dict[str
 		}
 	)
 	doc.insert(ignore_permissions=True)
+	if direction == "Inbound":
+		_apply_inbound_conversation_metadata(
+			conversation,
+			raw_timestamp=raw_timestamp,
+			count_unread=count_unread,
+			unread_watermark=unread_watermark,
+		)
 	return doc.name
 
 
@@ -442,10 +509,39 @@ def sync_facebook_conversations(*, limit: int = 50, max_pages: int = MAX_CONVERS
 
 
 def sync_conversation_messages(conversation_name: str, *, limit: int = 50, max_pages: int = MAX_MESSAGE_PAGES) -> dict:
-	"""Import message batches for one conversation. offset 0 = newest batch per contract."""
+	"""Import message batches for one conversation. offset 0 = newest batch per contract.
+
+	Unread / ``last_inbound_at`` policy (applied inside ``upsert_message_from_connector``):
+	- Snapshot a pre-sync watermark = ``last_inbound_at or last_message_at``.
+	- Initial import (no local messages yet): advance ``last_inbound_at`` from valid
+	  inbound connector times, but never increment ``unread_count``.
+	- Later syncs: increment unread only for new inbound inserts whose connector
+	  timestamp is strictly after the pre-sync watermark (historical backfill skipped).
+	- Dedup hits return early and never bump metadata.
+
+	Limitation: a first sync of an empty thread that also pulls a live tip will not
+	count that tip as unread; tips on already-synced threads will.
+	"""
 	conv = frappe.get_doc("Omnichannel Conversation", conversation_name)
 	if conv.provider != PROVIDER:
 		frappe.throw("Not a Facebook conversation")
+
+	# Pre-sync watermark + initial-import guard (see docstring limitation).
+	prior_message_count = frappe.db.count(
+		"Omnichannel Message", {"conversation": conversation_name}
+	)
+	meta = frappe.db.get_value(
+		"Omnichannel Conversation",
+		conversation_name,
+		["last_inbound_at", "last_message_at"],
+		as_dict=True,
+	)
+	unread_watermark = None
+	if meta:
+		unread_watermark = _as_compare_datetime(meta.last_inbound_at) or _as_compare_datetime(
+			meta.last_message_at
+		)
+	count_unread = prior_message_count > 0
 
 	log_name = start_sync_log(
 		PROVIDER, "Message Sync", conversation=conversation_name, channel=conv.channel
@@ -467,7 +563,13 @@ def sync_conversation_messages(conversation_name: str, *, limit: int = 50, max_p
 				break
 			# Contract: each batch is chronological; offset 0 is newest batch.
 			for row in items:
-				if upsert_message_from_connector(conv.name, conv.channel, row):
+				if upsert_message_from_connector(
+					conv.name,
+					conv.channel,
+					row,
+					count_unread=count_unread,
+					unread_watermark=unread_watermark,
+				):
 					processed += 1
 			pages += 1
 			has_more = bool(payload.get("has_more"))
