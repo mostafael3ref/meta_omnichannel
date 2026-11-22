@@ -63,6 +63,16 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   display: flex; justify-content: space-between; align-items: center; gap: 1rem;
   min-width: 0;
 }
+.oc-chat-title { min-width: 0; }
+.oc-chat-participant { display: block; }
+.oc-chat-page-name {
+  margin-top: .2rem; font-size: .9rem; font-weight: 600; color: var(--oc-ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.oc-chat-page-id {
+  margin-top: .1rem; font-size: .75rem; color: var(--oc-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .oc-messages {
   padding: 1.25rem; overflow: auto; display: flex; flex-direction: column; gap: .75rem;
   min-width: 0;

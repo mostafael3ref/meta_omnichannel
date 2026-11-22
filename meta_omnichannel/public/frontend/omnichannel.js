@@ -523,7 +523,43 @@
       last_inbound_at: fresh.last_inbound_at,
       last_message_preview: fresh.last_message_preview,
       unread_count: fresh.unread_count,
+      page_id: fresh.page_id,
+      page_name: fresh.page_name,
     });
+  }
+
+  function conversationPageName(c) {
+    return String((c && c.page_name) || "").trim();
+  }
+
+  function conversationPageId(c) {
+    return String((c && c.page_id) || "").trim();
+  }
+
+  function buildChatHeaderTitle(selected) {
+    const children = [
+      el("strong", {
+        className: "oc-chat-participant",
+        text: (selected && selected.participant_name) || t("empty_chat"),
+      }),
+    ];
+    if (selected) {
+      children.push(
+        el("div", {
+          className: "channel-pill",
+          text: `${selected.provider} · ${selected.status}`,
+        })
+      );
+      const pageName = conversationPageName(selected);
+      if (pageName) {
+        children.push(el("div", { className: "oc-chat-page-name", text: pageName }));
+      }
+      const pageId = conversationPageId(selected);
+      if (pageId) {
+        children.push(el("div", { className: "oc-chat-page-id", text: pageId }));
+      }
+    }
+    return el("div", { className: "oc-chat-title" }, children);
   }
 
   async function loadList() {
@@ -634,6 +670,8 @@
         if (c.unread_count != null) state.selected.unread_count = c.unread_count;
         if (c.last_inbound_at != null) state.selected.last_inbound_at = c.last_inbound_at;
         if (c.last_message_at != null) state.selected.last_message_at = c.last_message_at;
+        if (c.page_name != null) state.selected.page_name = c.page_name;
+        if (c.page_id != null) state.selected.page_id = c.page_id;
       }
       render();
     } catch (e) {
@@ -752,10 +790,12 @@
 
   function patchPreservedChatHeader(chatEl) {
     if (!chatEl || !state.selected) return;
-    const strong = chatEl.querySelector(".oc-chat-header strong");
-    if (strong) strong.textContent = state.selected.participant_name || t("empty_chat");
-    const pill = chatEl.querySelector(".oc-chat-header .channel-pill");
-    if (pill) pill.textContent = `${state.selected.provider} · ${state.selected.status}`;
+    const header = chatEl.querySelector(".oc-chat-header");
+    if (!header) return;
+    const nextTitle = buildChatHeaderTitle(state.selected);
+    const currentTitle = header.querySelector(".oc-chat-title");
+    if (currentTitle) currentTitle.replaceWith(nextTitle);
+    else header.insertBefore(nextTitle, header.firstChild);
   }
 
   function render(options) {
@@ -873,14 +913,7 @@
     } else {
       chat = el("section", { className: "oc-chat" });
       chat.appendChild(
-        el("header", { className: "oc-chat-header" }, [
-          el("div", null, [
-            el("strong", { text: (state.selected && state.selected.participant_name) || t("empty_chat") }),
-            state.selected
-              ? el("div", { className: "channel-pill", text: `${state.selected.provider} · ${state.selected.status}` })
-              : null,
-          ]),
-        ])
+        el("header", { className: "oc-chat-header" }, [buildChatHeaderTitle(state.selected)])
       );
       if (state.error) chat.appendChild(el("div", { className: "oc-error", text: state.error }));
       if (!state.selected) chat.appendChild(el("div", { className: "oc-empty", text: t("empty_chat") }));

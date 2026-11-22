@@ -211,11 +211,27 @@ class SoftRefreshInbox:
 
 class TestDeployedFrontendIsPlainBundle(unittest.TestCase):
 	def test_www_loads_public_frontend_bundle(self):
+		"""Deployed /omnichannel serves public/frontend (not Vue src directly)."""
 		html = WWW.read_text(encoding="utf-8")
-		self.assertIn("/assets/meta_omnichannel/frontend/omnichannel.js", html)
 		js = PLAIN_JS.read_text(encoding="utf-8")
+		self.assertIn("/assets/meta_omnichannel/frontend/omnichannel.js", html)
+		self.assertIn("/assets/meta_omnichannel/frontend/omnichannel.css", html)
+		self.assertNotIn("frontend/src/App.vue", html)
 		self.assertIn("no-build fallback", js)
 		self.assertNotIn("createApp", js)
+
+	def test_plain_js_chat_header_shows_page_name_and_id(self):
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		css = PLAIN_CSS.read_text(encoding="utf-8")
+		self.assertIn("function buildChatHeaderTitle", js)
+		self.assertIn("oc-chat-page-name", js)
+		self.assertIn("oc-chat-page-id", js)
+		self.assertIn("page_name", js)
+		self.assertIn("patchPreservedChatHeader", js)
+		self.assertIn("mergeSelectedFromList", js)
+		self.assertIn("fresh.page_name", js)
+		self.assertIn(".oc-chat-page-name", css)
+		self.assertIn(".oc-chat-page-id", css)
 
 
 class TestFrappeCallDoesNotDropMessageOnServerMessages(unittest.TestCase):

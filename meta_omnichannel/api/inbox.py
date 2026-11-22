@@ -17,7 +17,54 @@ from meta_omnichannel.permissions import (
 from meta_omnichannel.utils.datetimes import parse_connector_datetime_for_db
 
 
-def _serialize_conversation(row) -> dict:
+def _page_name_from_channel_fields(
+	external_account_name: Any, channel_name: Any
+) -> str | None:
+	"""Prefer Channel.external_account_name, then channel_name."""
+	for raw in (external_account_name, channel_name):
+		label = str(raw or "").strip()
+		if label:
+			return label
+	return None
+
+
+def _resolve_page_name_for_channel(channel_name: str | None) -> str | None:
+	"""Single-channel lookup (get_conversation / list_messages)."""
+	name = str(channel_name or "").strip()
+	if not name:
+		return None
+	row = frappe.db.get_value(
+		"Omnichannel Channel",
+		name,
+		["external_account_name", "channel_name"],
+		as_dict=True,
+	)
+	if not row:
+		return None
+	return _page_name_from_channel_fields(row.external_account_name, row.channel_name)
+
+
+def _channel_page_names(channel_names: list[Any]) -> dict[str, str]:
+	"""Batch map Omnichannel Channel name → display page_name (no N+1)."""
+	names = sorted({str(n or "").strip() for n in channel_names if str(n or "").strip()})
+	if not names:
+		return {}
+	rows = frappe.get_all(
+		"Omnichannel Channel",
+		filters={"name": ["in", names]},
+		fields=["name", "external_account_name", "channel_name"],
+		limit_page_length=len(names),
+	)
+	out: dict[str, str] = {}
+	for row in rows:
+		label = _page_name_from_channel_fields(row.external_account_name, row.channel_name)
+		if label:
+			out[row.name] = label
+	return out
+
+
+def _serialize_conversation(row, *, page_name: str | None = None) -> dict:
+	"""Serialize a conversation row. Pass ``page_name`` from a batched Channel lookup."""
 	return {
 		"name": row.name,
 		"provider": row.provider,
@@ -33,6 +80,7 @@ def _serialize_conversation(row) -> dict:
 		"crm_contact": row.crm_contact,
 		"crm_lead": row.crm_lead,
 		"page_id": row.page_id,
+		"page_name": (str(page_name).strip() if page_name else None) or None,
 	}
 
 
@@ -144,8 +192,11 @@ def list_conversations(
 		limit_start=offset,
 	)
 	total = frappe.db.count("Omnichannel Conversation", filters)
+	page_names = _channel_page_names([r.channel for r in rows])
 	return {
-		"items": [_serialize_conversation(r) for r in rows],
+		"items": [
+			_serialize_conversation(r, page_name=page_names.get(r.channel)) for r in rows
+		],
 		"total": total,
 		"limit": limit,
 		"offset": offset,
@@ -160,7 +211,9 @@ def get_conversation(name: str) -> dict:
 	doc = frappe.get_doc("Omnichannel Conversation", name)
 	if not has_conversation_permission(doc, "read"):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
-	return _serialize_conversation(doc)
+	return _serialize_conversation(
+		doc, page_name=_resolve_page_name_for_channel(doc.channel)
+	)
 
 
 @frappe.whitelist()
@@ -216,7 +269,9 @@ def list_messages(conversation: str, limit: int = 50, offset: int = 0) -> dict:
 		"offset": offset,
 		"has_more": offset + len(rows) < total,
 		"next_offset": offset + len(rows) if offset + len(rows) < total else None,
-		"conversation": _serialize_conversation(conv),
+		"conversation": _serialize_conversation(
+			conv, page_name=_resolve_page_name_for_channel(conv.channel)
+		),
 	}
 
 
