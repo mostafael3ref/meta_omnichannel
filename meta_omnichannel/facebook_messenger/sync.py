@@ -359,6 +359,70 @@ def _increment_unread_count(conversation: str) -> None:
 	)
 
 
+def _enqueue_facebook_attachment_persist_safe(message_name: str) -> None:
+	"""Call ``enqueue_facebook_attachment_persist``; never raise into sync."""
+	try:
+		from meta_omnichannel.jobs.sync_jobs import enqueue_facebook_attachment_persist
+
+		# Primary attachment only (index 0) — matches stored ``attachment_url``.
+		enqueue_facebook_attachment_persist(message_name, 0)
+	except Exception:
+		get_logger().info(
+			"facebook_attachment_persist_enqueue_failed message=%s",
+			message_name,
+		)
+
+
+def schedule_facebook_attachment_persist_after_commit(message_name: str) -> None:
+	"""Register attachment persist enqueue after a successful DB commit.
+
+	Frappe v15 supports ``frappe.db.after_commit.add(callback)`` (same hook used
+	internally by ``frappe.enqueue(..., enqueue_after_commit=True)``). Callbacks
+	run only after ``COMMIT``; they are discarded on rollback — so jobs are never
+	queued for uncommitted message rows.
+	"""
+	name = (message_name or "").strip()
+	if not name:
+		return
+	try:
+		frappe.db.after_commit.add(
+			lambda message_name=name: _enqueue_facebook_attachment_persist_safe(message_name)
+		)
+	except Exception:
+		get_logger().info(
+			"facebook_attachment_persist_schedule_failed message=%s",
+			name,
+		)
+
+
+def _maybe_schedule_attachment_persist(
+	message_name: str, *, known_attachment_url: str | None = None
+) -> None:
+	"""Schedule persist when the message has primary attachment metadata.
+
+	Text-only messages (no ``attachment_url``) are never scheduled. Does not invent
+	URLs or multi-attachment indexes beyond the single stored primary field.
+	"""
+	name = (message_name or "").strip()
+	if not name:
+		return
+	if known_attachment_url is not None:
+		if not str(known_attachment_url).strip():
+			return
+	else:
+		try:
+			stored = frappe.db.get_value("Omnichannel Message", name, "attachment_url")
+		except Exception:
+			get_logger().info(
+				"facebook_attachment_persist_lookup_failed message=%s",
+				name,
+			)
+			return
+		if not (stored or "").strip():
+			return
+	schedule_facebook_attachment_persist_after_commit(name)
+
+
 def _apply_inbound_conversation_metadata(
 	conversation: str,
 	*,
@@ -429,8 +493,11 @@ def upsert_message_from_connector(
 		)
 		if existing:
 			_maybe_repair_null_sent_at(existing.name, existing.sent_at, raw_timestamp)
+			# Re-sync of an existing attachment message: enqueue if not yet Ready.
+			_maybe_schedule_attachment_persist(existing.name)
 			return existing.name
 		# Unique external_message_id elsewhere: never insert a duplicate.
+		# Do not schedule attachment persist — the row belongs to another thread.
 		elsewhere = frappe.db.get_value(
 			"Omnichannel Message", {"external_message_id": external_id}, "name"
 		)
@@ -446,6 +513,7 @@ def upsert_message_from_connector(
 	)
 	existing_fp = frappe.db.get_value("Omnichannel Message", {"raw_payload_hash": fingerprint}, "name")
 	if existing_fp:
+		_maybe_schedule_attachment_persist(existing_fp)
 		return existing_fp
 
 	doc = frappe.get_doc(
@@ -475,6 +543,8 @@ def upsert_message_from_connector(
 			count_unread=count_unread,
 			unread_watermark=unread_watermark,
 		)
+	# New insert: schedule only when primary attachment metadata was stored.
+	_maybe_schedule_attachment_persist(doc.name, known_attachment_url=attachment_url)
 	return doc.name
 
 
