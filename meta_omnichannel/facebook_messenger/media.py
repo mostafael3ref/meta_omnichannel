@@ -524,6 +524,71 @@ def is_attachment_ready(message_name: str, attachment_index: int) -> bool:
 	)
 
 
+def _safe_private_file_url(file_url: Any) -> str | None:
+	"""Return a trusted ``/private/files/...`` path only (never filesystem paths)."""
+	url = str(file_url or "").strip()
+	if not url.startswith("/private/files/"):
+		return None
+	if url.startswith("//") or ".." in url or "\\" in url or "\0" in url:
+		return None
+	if any(ch.isspace() for ch in url):
+		return None
+	return url
+
+
+def get_ready_attachment_file_url(
+	message_name: str, attachment_index: int = 0
+) -> str | None:
+	"""Private File URL when Ready + valid; otherwise ``None`` (no Failed/Pending leak)."""
+	message_name = (message_name or "").strip()
+	if not message_name:
+		return None
+	index = _parse_attachment_index(attachment_index)
+	row = _get_child_row(message_name, index)
+	if row is None:
+		return None
+	if (row.status or "") != "Ready":
+		return None
+	if not (row.content_hash or "").strip():
+		return None
+	if not _file_is_valid_private(row.file, message_name):
+		return None
+	raw = frappe.db.get_value("File", row.file, "file_url")
+	return _safe_private_file_url(raw)
+
+
+def map_ready_attachment_file_urls(
+	message_names: list[str], attachment_index: int = 0
+) -> dict[str, str]:
+	"""Batch map message name → trusted ``/private/files/...`` for Ready attachments."""
+	index = _parse_attachment_index(attachment_index)
+	names = [str(n).strip() for n in message_names if str(n or "").strip()]
+	if not names:
+		return {}
+	rows = frappe.get_all(
+		CHILD_DOCTYPE,
+		filters={
+			"parent": ["in", names],
+			"parenttype": MESSAGE_DOCTYPE,
+			"attachment_index": index,
+			"status": "Ready",
+		},
+		fields=["parent", "file", "content_hash", "status"],
+		limit_page_length=len(names),
+	)
+	out: dict[str, str] = {}
+	for row in rows:
+		parent = (row.parent or "").strip()
+		if not parent or not (row.content_hash or "").strip():
+			continue
+		if not _file_is_valid_private(row.file, parent):
+			continue
+		url = _safe_private_file_url(frappe.db.get_value("File", row.file, "file_url"))
+		if url:
+			out[parent] = url
+	return out
+
+
 def _lock_lost_result(message_name: str, index: int, *, downloaded: bool) -> dict[str, Any]:
 	return _result(
 		ok=False,

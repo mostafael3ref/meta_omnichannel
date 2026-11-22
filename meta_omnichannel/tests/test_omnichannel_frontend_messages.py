@@ -15,7 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from meta_omnichannel.tests._attachment_url_contract import safe_https_url
+from meta_omnichannel.tests._attachment_url_contract import (
+	attachment_download_href,
+	preferred_attachment_url,
+	safe_attachment_url,
+	safe_https_url,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 PLAIN_JS = ROOT / "meta_omnichannel" / "public" / "frontend" / "omnichannel.js"
@@ -288,11 +293,46 @@ class TestSafeHttpsUrlContract(unittest.TestCase):
 		self.assertIsNone(safe_https_url(None))
 		self.assertIsNone(safe_https_url("not a url"))
 
+	def test_safe_attachment_url_accepts_private_and_https(self):
+		self.assertEqual(
+			safe_attachment_url("/private/files/omni_x.jpg"),
+			"/private/files/omni_x.jpg",
+		)
+		self.assertEqual(
+			preferred_attachment_url(
+				attachment_file_url="/private/files/a.jpg",
+				attachment_url="https://cdn.example/a.jpg",
+			),
+			"/private/files/a.jpg",
+		)
+		self.assertIsNone(safe_attachment_url("//cdn.example/x"))
+		self.assertIsNone(safe_attachment_url("/files/public.jpg"))
+		self.assertIsNone(safe_attachment_url("javascript:alert(1)"))
+
+	def test_private_download_uses_frappe_handler(self):
+		href = attachment_download_href("/private/files/omni_x.jpg")
+		self.assertIsNotNone(href)
+		self.assertTrue(href.startswith("/api/method/frappe.handler.download_file?"))
+		self.assertIn("file_url=", href)
+		self.assertIn("omni_x.jpg", href)
+		# External Meta: plain https fallback (no forced download claim).
+		self.assertEqual(
+			attachment_download_href("https://cdn.example/a.jpg"),
+			"https://cdn.example/a.jpg",
+		)
+
 	def test_plain_js_and_vue_enforce_https(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
 		vue = VUE_APP.read_text(encoding="utf-8")
 		self.assertIn("function safeHttpsUrl", js)
 		self.assertIn('u.protocol !== "https:"', js)
+		self.assertIn("function safeAttachmentUrl", js)
+		self.assertIn("function safePrivateFilePath", js)
+		self.assertIn("preferredAttachmentUrl", js)
+		self.assertIn("/private/files/", js)
+		self.assertIn("frappe.handler.download_file", js)
+		self.assertIn("function getLightboxFocusables", js)
+		self.assertIn("lightboxTrigger", js)
 		self.assertIn("function safeHttpsUrl", vue)
 		self.assertIn('u.protocol !== "https:"', vue)
 
@@ -318,6 +358,14 @@ class TestAttachmentRenderingSource(unittest.TestCase):
 		# Captions preserved separately from media.
 		self.assertIn('className: "oc-bubble-text"', js)
 		self.assertIn("attachment_unavailable", js)
+		self.assertIn("preferredAttachmentUrl(m)", js)
+		self.assertIn("openImageLightbox", js)
+		self.assertIn("Escape", js)
+		self.assertIn("download_attachment", js)
+		self.assertIn("attachmentDownloadHref", js)
+		self.assertIn("renderDownloadAction", js)
+		self.assertIn('ev.key !== "Tab"', js)
+		self.assertIn("trigger.focus", js)
 
 	def test_plain_js_never_injects_attachment_via_innerhtml(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
@@ -340,11 +388,18 @@ class TestAttachmentRenderingSource(unittest.TestCase):
 		self.assertNotIn('<a :href="m.attachment_url" target="_blank" rel="noopener">Attachment</a>', vue)
 
 	def test_css_constrains_media(self):
-		for path in (PLAIN_CSS, VUE_CSS):
-			css = path.read_text(encoding="utf-8")
-			self.assertIn(".oc-attach-media", css)
-			self.assertIn("max-width: 100%", css)
-			self.assertIn("max-height: 320px", css)
+		plain = PLAIN_CSS.read_text(encoding="utf-8")
+		self.assertIn(".oc-attach-media", plain)
+		self.assertIn("max-width: 100%", plain)
+		self.assertIn("max-height: 320px", plain)
+		self.assertIn("min-width: 0", plain)
+		self.assertIn("object-fit: contain", plain)
+		self.assertIn(".oc-lightbox", plain)
+		# Vue CSS unchanged in this step — keep prior media constraints.
+		vue_css = VUE_CSS.read_text(encoding="utf-8")
+		self.assertIn(".oc-attach-media", vue_css)
+		self.assertIn("max-width: 100%", vue_css)
+		self.assertIn("max-height: 320px", vue_css)
 
 
 class TestRealtimeSoftRefreshContract(unittest.TestCase):

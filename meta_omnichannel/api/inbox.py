@@ -36,6 +36,39 @@ def _serialize_conversation(row) -> dict:
 	}
 
 
+_MESSAGE_LIST_FIELDS = (
+	"name",
+	"direction",
+	"message_type",
+	"text_content",
+	"delivery_status",
+	"sent_at",
+	"attachment_url",
+	"attachment_mime",
+	"is_internal_note",
+	"error_summary",
+	"external_message_id",
+)
+
+
+def _message_row_name(row: Any) -> str:
+	if isinstance(row, dict):
+		return str(row.get("name") or "")
+	return str(getattr(row, "name", None) or "")
+
+
+def _message_row_dict(row: Any) -> dict[str, Any]:
+	"""Normalize get_all rows (dict / _dict / SimpleNamespace) for JSON-safe enrichment."""
+	if isinstance(row, dict):
+		return {k: row.get(k) for k in _MESSAGE_LIST_FIELDS}
+	as_dict = getattr(row, "as_dict", None)
+	if callable(as_dict):
+		data = as_dict()
+		if isinstance(data, dict):
+			return {k: data.get(k) for k in _MESSAGE_LIST_FIELDS}
+	return {k: getattr(row, k, None) for k in _MESSAGE_LIST_FIELDS}
+
+
 def _parse_read_watermark(value: Any) -> datetime | None:
 	"""Normalize a client open-time read watermark to a naive datetime."""
 	if value is None or value == "":
@@ -163,8 +196,21 @@ def list_messages(conversation: str, limit: int = 50, offset: int = 0) -> dict:
 	total = frappe.db.count("Omnichannel Message", {"conversation": conversation})
 	# Fetch only — never clear unread here (open / soft-refresh / pagination share this).
 
+	# Enrich with Ready private File URLs (conversation auth already checked above).
+	from meta_omnichannel.facebook_messenger import media as fb_media
+
+	local_urls = fb_media.map_ready_attachment_file_urls(
+		[_message_row_name(r) for r in rows], attachment_index=0
+	)
+	items: list[dict[str, Any]] = []
+	for row in rows:
+		item = _message_row_dict(row)
+		# Trusted /private/files/... only when Ready+valid; never invent paths.
+		item["attachment_file_url"] = local_urls.get(item.get("name"))
+		items.append(item)
+
 	return {
-		"items": rows,
+		"items": items,
 		"total": total,
 		"limit": limit,
 		"offset": offset,

@@ -211,6 +211,46 @@ class TestHasMessagePermission(unittest.TestCase):
 		self.assertEqual(args.args[0], "Omnichannel Conversation")
 		self.assertEqual(args.args[1], "CONV-1")
 
+	def test_private_file_download_follows_message_read_not_weakened(self):
+		"""Document Frappe File auth for Omnichannel attachments (no File hook).
+
+		Frappe ``File.has_permission`` / ``download_private_file`` /
+		``frappe.handler.download_file`` authorize private Files via
+		``attached_to`` document read. For our Files that means Omnichannel
+		Message read (role table + ``has_message_permission`` conversation
+		scope). We intentionally do **not** register a File ``has_permission``
+		hook and must not weaken File permissions.
+		"""
+		import json
+		from pathlib import Path
+
+		hooks = Path(__file__).resolve().parents[1] / "hooks.py"
+		text = hooks.read_text(encoding="utf-8")
+		self.assertNotIn('"File"', text)
+		self.assertIn(
+			'"Omnichannel Message": "meta_omnichannel.permissions.has_message_permission"',
+			text,
+		)
+
+		msg_json = (
+			Path(__file__).resolve().parents[1]
+			/ "meta_omnichannel"
+			/ "doctype"
+			/ "omnichannel_message"
+			/ "omnichannel_message.json"
+		)
+		meta = json.loads(msg_json.read_text(encoding="utf-8"))
+		agent = next(p for p in meta["permissions"] if p["role"] == "Omnichannel Agent")
+		self.assertEqual(agent.get("read"), 1)
+
+		# Assigned agent may read the message → File download may proceed via Frappe.
+		self.assertTrue(self.perm.has_message_permission(self._message_doc(), "read"))
+		# Other agent on assigned thread is denied → File download must also fail closed.
+		self.frappe.db.get_value.return_value = SimpleNamespace(
+			name="CONV-1", assigned_to="other@example.com"
+		)
+		self.assertFalse(self.perm.has_message_permission(self._message_doc(), "read"))
+
 	def test_frappe_hook_kwargs_debug_accepted_allow_and_deny(self):
 		"""Frappe calls hooks as frappe.call(..., ptype=..., user=..., debug=...)."""
 		conv = {"name": "CONV-1", "assigned_to": "agent@example.com"}

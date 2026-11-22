@@ -1,0 +1,282 @@
+"""Focused tests: list_messages exposes Ready private File URLs only."""
+
+from __future__ import annotations
+
+import importlib
+import sys
+import types
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+
+def _install_inbox_frappe() -> MagicMock:
+	frappe = MagicMock()
+	frappe._ = lambda x: x
+	frappe.PermissionError = type("PermissionError", (Exception,), {})
+	frappe.ValidationError = type("ValidationError", (Exception,), {})
+	frappe.throw = MagicMock(side_effect=Exception("throw"))
+	frappe.db = MagicMock()
+	frappe.get_doc = MagicMock()
+	frappe.get_all = MagicMock(return_value=[])
+	frappe.whitelist = lambda *a, **k: (lambda fn: fn)
+	sys.modules["frappe"] = frappe
+	utils = types.ModuleType("frappe.utils")
+	utils.__path__ = []  # type: ignore[attr-defined]  # allow frappe.utils.* stubs
+	utils.cint = lambda v: int(v or 0)  # type: ignore[attr-defined]
+	sys.modules["frappe.utils"] = utils
+	return frappe
+
+
+class TestListMessagesAttachmentFileUrl(unittest.TestCase):
+	@classmethod
+	def setUpClass(cls):
+		cls.frappe = _install_inbox_frappe()
+		perm = types.ModuleType("meta_omnichannel.permissions")
+		perm.ensure_omnichannel_agent = MagicMock()  # type: ignore[attr-defined]
+		perm.has_conversation_permission = MagicMock(return_value=True)  # type: ignore[attr-defined]
+		perm.user_is_omnichannel_admin = MagicMock(return_value=True)  # type: ignore[attr-defined]
+		sys.modules["meta_omnichannel.permissions"] = perm
+		# file_manager must exist before media import (frappe.utils is a stub module).
+		fm = types.ModuleType("frappe.utils.file_manager")
+		fm.save_file = MagicMock()  # type: ignore[attr-defined]
+		fm.get_file_path = MagicMock(  # type: ignore[attr-defined]
+			return_value="/tmp/private/files/x.bin"
+		)
+		sys.modules["frappe.utils.file_manager"] = fm
+		# Ensure media is importable before inbox lazy-imports it.
+		import meta_omnichannel.facebook_messenger.media as media_mod
+		import meta_omnichannel.api.inbox as inbox_mod
+
+		importlib.reload(media_mod)
+		importlib.reload(inbox_mod)
+		cls.media = media_mod
+		cls.inbox = inbox_mod
+		cls.perm = perm
+
+	def setUp(self):
+		self.frappe.db.reset_mock()
+		self.frappe.get_doc.reset_mock()
+		self.frappe.get_all.reset_mock()
+		self.frappe.throw.reset_mock(side_effect=True)
+		self.frappe.throw.side_effect = Exception("throw")
+		self.perm.ensure_omnichannel_agent.reset_mock()
+		self.perm.has_conversation_permission.reset_mock()
+		self.perm.has_conversation_permission.return_value = True
+		self.conv = SimpleNamespace(
+			name="CONV-1",
+			provider="Facebook",
+			channel="CH",
+			participant_name="A",
+			participant_id="S1",
+			status="Open",
+			assigned_to=None,
+			unread_count=1,
+			last_message_at=None,
+			last_message_preview="",
+			last_inbound_at=None,
+			crm_contact=None,
+			crm_lead=None,
+			page_id="P1",
+		)
+		self.frappe.get_doc.return_value = self.conv
+		self.frappe.db.count.return_value = 1
+
+	def test_ready_local_url_attached(self):
+		msg = SimpleNamespace(
+			name="MSG-1",
+			direction="Inbound",
+			message_type="Image",
+			text_content="",
+			delivery_status="Delivered",
+			sent_at=None,
+			attachment_url="https://cdn.example/x.jpg",
+			attachment_mime="image/jpeg",
+			is_internal_note=0,
+			error_summary=None,
+			external_message_id="m1",
+		)
+		self.frappe.get_all.return_value = [msg]
+		with patch.object(
+			self.media,
+			"map_ready_attachment_file_urls",
+			return_value={"MSG-1": "/private/files/omni_msg1_0.jpg"},
+		) as mapped:
+			result = self.inbox.list_messages("CONV-1")
+		mapped.assert_called_once()
+		item = result["items"][0]
+		self.assertEqual(item["attachment_url"], "https://cdn.example/x.jpg")
+		self.assertEqual(item["attachment_file_url"], "/private/files/omni_msg1_0.jpg")
+		self.perm.has_conversation_permission.assert_called()
+
+	def test_pending_or_invalid_yields_null_local_url(self):
+		msg = SimpleNamespace(
+			name="MSG-2",
+			direction="Inbound",
+			message_type="Image",
+			text_content="",
+			delivery_status="Delivered",
+			sent_at=None,
+			attachment_url="https://cdn.example/y.jpg",
+			attachment_mime="image/jpeg",
+			is_internal_note=0,
+			error_summary=None,
+			external_message_id="m2",
+		)
+		self.frappe.get_all.return_value = [msg]
+		with patch.object(
+			self.media, "map_ready_attachment_file_urls", return_value={}
+		):
+			result = self.inbox.list_messages("CONV-1")
+		self.assertIsNone(result["items"][0]["attachment_file_url"])
+		self.assertEqual(result["items"][0]["attachment_url"], "https://cdn.example/y.jpg")
+
+	def test_unauthorized_conversation_does_not_map_files(self):
+		self.perm.has_conversation_permission.return_value = False
+		with patch.object(self.media, "map_ready_attachment_file_urls") as mapped:
+			with self.assertRaises(Exception):
+				self.inbox.list_messages("CONV-1")
+		mapped.assert_not_called()
+
+
+class TestReadyAttachmentFileUrlHelper(unittest.TestCase):
+	@classmethod
+	def setUpClass(cls):
+		frappe = MagicMock()
+		frappe._ = lambda x: x
+		frappe.ValidationError = type("ValidationError", (Exception,), {})
+		frappe.throw = MagicMock(
+			side_effect=lambda *a, **k: (_ for _ in ()).throw(
+				frappe.ValidationError(a[0] if a else "throw")
+			)
+		)
+		frappe.db = MagicMock()
+		frappe.get_all = MagicMock(return_value=[])
+		frappe.cache = MagicMock()
+		sys.modules["frappe"] = frappe
+		utils = types.ModuleType("frappe.utils")
+		utils.cint = lambda v: int(v or 0)  # type: ignore[attr-defined]
+		sys.modules["frappe.utils"] = utils
+		fm = types.ModuleType("frappe.utils.file_manager")
+		fm.save_file = MagicMock()  # type: ignore[attr-defined]
+		fm.get_file_path = MagicMock(  # type: ignore[attr-defined]
+			return_value="/tmp/private/files/x.bin"
+		)
+		sys.modules["frappe.utils.file_manager"] = fm
+		import meta_omnichannel.facebook_messenger.media as media_mod
+
+		importlib.reload(media_mod)
+		cls.media = media_mod
+		cls.frappe = frappe
+
+	def setUp(self):
+		self.frappe.get_all.return_value = []
+		self.frappe.db.get_value.return_value = None
+
+	def test_rejects_non_ready_status(self):
+		self.frappe.get_all.return_value = [
+			SimpleNamespace(
+				name="ATT-1",
+				attachment_index=0,
+				status="Pending",
+				file="FILE-1",
+				content_hash="abc",
+				mime_type="image/jpeg",
+				attachment_type="image",
+				error_summary=None,
+			)
+		]
+		self.assertIsNone(self.media.get_ready_attachment_file_url("MSG-1", 0))
+
+	def test_rejects_invalid_private_file(self):
+		self.frappe.get_all.return_value = [
+			SimpleNamespace(
+				name="ATT-1",
+				attachment_index=0,
+				status="Ready",
+				file="FILE-1",
+				content_hash="abc",
+				mime_type="image/jpeg",
+				attachment_type="image",
+				error_summary=None,
+			)
+		]
+		with patch.object(self.media, "_file_is_valid_private", return_value=False):
+			self.assertIsNone(self.media.get_ready_attachment_file_url("MSG-1", 0))
+
+	def test_returns_safe_private_url(self):
+		self.frappe.get_all.return_value = [
+			SimpleNamespace(
+				name="ATT-1",
+				attachment_index=0,
+				status="Ready",
+				file="FILE-1",
+				content_hash="abc",
+				mime_type="image/jpeg",
+				attachment_type="image",
+				error_summary=None,
+			)
+		]
+		self.frappe.db.get_value.return_value = "/private/files/omni_ok.jpg"
+		with patch.object(self.media, "_file_is_valid_private", return_value=True):
+			url = self.media.get_ready_attachment_file_url("MSG-1", 0)
+		self.assertEqual(url, "/private/files/omni_ok.jpg")
+
+	def test_safe_private_file_url_rejects_bad_paths(self):
+		self.assertIsNone(self.media._safe_private_file_url("/files/public.jpg"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/../etc/passwd"))
+		self.assertIsNone(self.media._safe_private_file_url("//evil.example/x"))
+		self.assertIsNone(self.media._safe_private_file_url("C:\\Windows\\x"))
+		self.assertEqual(
+			self.media._safe_private_file_url("/private/files/ok.jpg"),
+			"/private/files/ok.jpg",
+		)
+
+
+class TestPreferredAttachmentUrlContract(unittest.TestCase):
+	def test_prefers_local_over_meta(self):
+		from meta_omnichannel.tests._attachment_url_contract import preferred_attachment_url
+
+		self.assertEqual(
+			preferred_attachment_url(
+				attachment_file_url="/private/files/a.jpg",
+				attachment_url="https://cdn.example/a.jpg",
+			),
+			"/private/files/a.jpg",
+		)
+
+	def test_falls_back_to_https(self):
+		from meta_omnichannel.tests._attachment_url_contract import preferred_attachment_url
+
+		self.assertEqual(
+			preferred_attachment_url(
+				attachment_file_url=None,
+				attachment_url="https://cdn.example/a.jpg",
+			),
+			"https://cdn.example/a.jpg",
+		)
+
+	def test_rejects_untrusted(self):
+		from meta_omnichannel.tests._attachment_url_contract import safe_attachment_url
+
+		self.assertIsNone(safe_attachment_url("javascript:alert(1)"))
+		self.assertIsNone(safe_attachment_url("data:text/html,x"))
+		self.assertIsNone(safe_attachment_url("//cdn.example/x"))
+		self.assertIsNone(safe_attachment_url("/public/files/x"))
+		self.assertIsNone(safe_attachment_url("../private/files/x"))
+		self.assertIsNone(safe_attachment_url("http://cdn.example/x"))
+
+	def test_download_href_uses_frappe_api_for_private(self):
+		from meta_omnichannel.tests._attachment_url_contract import attachment_download_href
+
+		href = attachment_download_href("/private/files/omni_ok.jpg")
+		self.assertIn("frappe.handler.download_file", href)
+		self.assertIn("file_url=", href)
+		self.assertEqual(
+			attachment_download_href("https://cdn.example/a.jpg"),
+			"https://cdn.example/a.jpg",
+		)
+
+
+if __name__ == "__main__":
+	unittest.main()

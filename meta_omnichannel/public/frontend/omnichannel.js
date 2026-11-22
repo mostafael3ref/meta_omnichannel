@@ -33,6 +33,8 @@
       open_contact: "Open Contact",
       open_attachment: "Open attachment",
       attachment_unavailable: "Attachment unavailable",
+      close_lightbox: "Close",
+      download_attachment: "Download",
     },
     ar: {
       inbox: "الوارد",
@@ -61,6 +63,8 @@
       open_contact: "فتح جهة الاتصال",
       open_attachment: "فتح المرفق",
       attachment_unavailable: "المرفق غير متاح",
+      close_lightbox: "إغلاق",
+      download_attachment: "تنزيل",
     },
   };
   const t = (k) => (rtl ? i18n.ar : i18n.en)[k] || i18n.en[k] || k;
@@ -82,6 +86,33 @@
     }
   }
 
+  /**
+   * Trusted same-origin private File path only.
+   * Rejects protocol-relative, traversal, schemes, and untrusted relative paths.
+   */
+  function safePrivateFilePath(raw) {
+    const s = String(raw || "").trim();
+    if (!s || !s.startsWith("/private/files/")) return null;
+    if (s.startsWith("//")) return null;
+    if (s.includes("..") || s.includes("\\") || s.includes("\0")) return null;
+    if (/\s/.test(s)) return null;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return null;
+    return s;
+  }
+
+  /** Prefer private File paths or https CDN — never javascript:/data:/http:. */
+  function safeAttachmentUrl(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return null;
+    if (s.startsWith("/")) return safePrivateFilePath(s);
+    return safeHttpsUrl(s);
+  }
+
+  /** Local Ready File first; fall back to Meta HTTPS URL. */
+  function preferredAttachmentUrl(m) {
+    return safeAttachmentUrl(m && m.attachment_file_url) || safeAttachmentUrl(m && m.attachment_url);
+  }
+
   function attachmentLinkLabel(messageType) {
     const kind = String(messageType || "").trim();
     if (kind === "Image" || kind === "Audio" || kind === "Video" || kind === "File") {
@@ -100,12 +131,140 @@
     });
   }
 
+  /**
+   * Same-origin private Files: Frappe ``download_file`` (session + File/Message
+   * permission → Content-Disposition: attachment). External Meta HTTPS stays a
+   * plain link — browsers may ignore cross-origin ``download``.
+   */
+  function attachmentDownloadHref(url) {
+    const privatePath = safePrivateFilePath(url);
+    if (privatePath) {
+      return (
+        "/api/method/frappe.handler.download_file?file_url=" +
+        encodeURIComponent(privatePath)
+      );
+    }
+    return safeHttpsUrl(url) || null;
+  }
+
+  function renderDownloadAction(url) {
+    const href = attachmentDownloadHref(url);
+    if (!href) return null;
+    const isPrivate = !!safePrivateFilePath(url);
+    const attrs = {
+      className: "oc-btn secondary",
+      href: href,
+      rel: "noopener noreferrer",
+      text: t("download_attachment"),
+    };
+    if (!isPrivate) {
+      attrs.target = "_blank";
+      attrs.download = "";
+      attrs.title = t("open_attachment");
+    }
+    return el("a", attrs);
+  }
+
+  let lightboxTrigger = null;
+
+  function getLightboxFocusables(root) {
+    if (!root) return [];
+    return Array.prototype.slice
+      .call(root.querySelectorAll('a[href], button:not([disabled])'))
+      .filter(function (node) {
+        return node && node.offsetParent !== null;
+      });
+  }
+
+  function closeImageLightbox() {
+    const existing = document.getElementById("oc-lightbox");
+    if (existing) existing.remove();
+    document.removeEventListener("keydown", onLightboxKeydown);
+    const trigger = lightboxTrigger;
+    lightboxTrigger = null;
+    if (trigger && typeof trigger.focus === "function") {
+      try {
+        trigger.focus();
+      } catch (_) {}
+    }
+  }
+
+  function onLightboxKeydown(ev) {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      closeImageLightbox();
+      return;
+    }
+    if (ev.key !== "Tab") return;
+    const root = document.getElementById("oc-lightbox");
+    const focusables = getLightboxFocusables(root);
+    if (!focusables.length) {
+      ev.preventDefault();
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (ev.shiftKey && document.activeElement === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  }
+
+  function openImageLightbox(url, altText, triggerEl) {
+    const existing = document.getElementById("oc-lightbox");
+    if (existing) existing.remove();
+    document.removeEventListener("keydown", onLightboxKeydown);
+    lightboxTrigger = triggerEl || null;
+
+    const backdrop = el("div", {
+      id: "oc-lightbox",
+      className: "oc-lightbox",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": altText || t("open_attachment"),
+      onclick: (ev) => {
+        if (ev.target === backdrop) closeImageLightbox();
+      },
+    });
+    const panel = el("div", { className: "oc-lightbox-panel" });
+    panel.appendChild(
+      el("img", {
+        className: "oc-lightbox-img",
+        src: url,
+        alt: altText || "Image attachment",
+      })
+    );
+    const actions = el("div", { className: "oc-lightbox-actions" });
+    const downloadBtn = renderDownloadAction(url);
+    if (downloadBtn) actions.appendChild(downloadBtn);
+    actions.appendChild(
+      el("button", {
+        type: "button",
+        className: "oc-btn",
+        text: t("close_lightbox"),
+        onclick: closeImageLightbox,
+      })
+    );
+    panel.appendChild(actions);
+    backdrop.appendChild(panel);
+    document.body.appendChild(backdrop);
+    document.addEventListener("keydown", onLightboxKeydown);
+    const focusables = getLightboxFocusables(backdrop);
+    if (focusables.length) focusables[0].focus();
+  }
+
   function renderAttachmentBlock(m) {
-    const raw = m.attachment_url;
-    const url = safeHttpsUrl(raw);
+    const localRaw = m.attachment_file_url;
+    const metaRaw = m.attachment_url;
+    const url = preferredAttachmentUrl(m);
     const type = m.message_type || "Unknown";
     if (!url) {
-      if (raw) return el("div", { className: "oc-attach-fallback", text: t("attachment_unavailable") });
+      if (localRaw || metaRaw) {
+        return el("div", { className: "oc-attach-fallback", text: t("attachment_unavailable") });
+      }
       return null;
     }
     const wrap = el("div", { className: "oc-attach" });
@@ -115,12 +274,23 @@
       node.replaceWith(renderSafeAttachmentLink(url, type));
     };
     if (type === "Image") {
+      const alt = (m.text_content || "").trim() || "Image attachment";
       wrap.appendChild(
         el("img", {
-          className: "oc-attach-media",
+          className: "oc-attach-media oc-attach-thumb",
           src: url,
-          alt: (m.text_content || "").trim() || "Image attachment",
+          alt: alt,
           loading: "lazy",
+          tabindex: "0",
+          role: "button",
+          title: t("open_attachment"),
+          onclick: (ev) => openImageLightbox(url, alt, ev.currentTarget),
+          onkeydown: (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              openImageLightbox(url, alt, ev.currentTarget);
+            }
+          },
           onerror: onMediaError,
         })
       );
@@ -141,6 +311,7 @@
           src: url,
           controls: true,
           preload: "metadata",
+          playsinline: true,
           onerror: onMediaError,
         })
       );
