@@ -1,0 +1,77 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-11-22 11:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "attachment_index",
+  "attachment_type",
+  "mime_type",
+  "file",
+  "content_hash",
+  "status",
+  "error_summary"
+ ],
+ "fields": [
+  {
+   "fieldname": "attachment_index",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Attachment Index",
+   "reqd": 1
+  },
+  {
+   "fieldname": "attachment_type",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Attachment Type"
+  },
+  {
+   "fieldname": "mime_type",
+   "fieldtype": "Data",
+   "label": "MIME Type"
+  },
+  {
+   "fieldname": "file",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "File",
+   "options": "File"
+  },
+  {
+   "fieldname": "content_hash",
+   "fieldtype": "Data",
+   "label": "Content Hash",
+   "read_only": 1
+  },
+  {
+   "default": "Pending",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Pending\nReady\nFailed",
+   "reqd": 1
+  },
+  {
+   "fieldname": "error_summary",
+   "fieldtype": "Small Text",
+   "label": "Error Summary",
+   "read_only": 1
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-22 11:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Meta Omnichannel",
+ "name": "Omnichannel Message Attachment",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

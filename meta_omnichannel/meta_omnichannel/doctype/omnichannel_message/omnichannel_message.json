@@ -20,6 +20,7 @@
   "sender_external_id",
   "attachment_url",
   "attachment_mime",
+  "attachments",
   "raw_payload_hash",
   "error_summary",
   "is_internal_note"
@@ -118,6 +119,13 @@
    "label": "Attachment MIME"
   },
   {
+   "fieldname": "attachments",
+   "fieldtype": "Table",
+   "label": "Attachments",
+   "options": "Omnichannel Message Attachment",
+   "description": "Durable private attachment rows (multi-file). Legacy attachment_url/mime remain for provenance until persistence lands."
+  },
+  {
    "fieldname": "raw_payload_hash",
    "fieldtype": "Data",
    "label": "Payload Hash",
@@ -138,7 +146,7 @@
  ],
  "issingle": 0,
  "links": [],
- "modified": "2026-11-18 16:20:00.000000",
+ "modified": "2026-11-22 11:00:00.000000",
  "modified_by": "Administrator",
  "module": "Meta Omnichannel",
  "name": "Omnichannel Message",
