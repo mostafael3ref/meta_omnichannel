@@ -454,10 +454,14 @@ class TestAttachmentRenderingSource(unittest.TestCase):
 	def test_css_viewport_bounded_independent_scroll(self):
 		"""Inbox shell stays viewport-bound; messages + list scroll inside columns."""
 		css = PLAIN_CSS.read_text(encoding="utf-8")
-		# Page shell must not grow with message history.
-		self.assertIn("overflow: hidden", css)
+		# Account for Frappe website header so the composer stays on-screen.
+		self.assertIn("--oc-web-chrome", css)
+		self.assertIn("calc(100vh - var(--oc-web-chrome))", css)
+		self.assertIn("calc(100dvh - var(--oc-web-chrome))", css)
+		# Shell fills the app root — not raw 100dvh (that ignores the navbar).
 		self.assertRegex(css, r"\.oc-shell\s*\{[^}]*height:\s*100%")
 		self.assertRegex(css, r"\.oc-shell\s*\{[^}]*overflow:\s*hidden")
+		self.assertNotRegex(css, r"\.oc-shell\s*\{[^}]*100dvh")
 		self.assertRegex(
 			css,
 			r"\.oc-side,\s*\.oc-list,\s*\.oc-chat,\s*\.oc-customer\s*\{[^}]*min-height:\s*0",
@@ -476,6 +480,33 @@ class TestAttachmentRenderingSource(unittest.TestCase):
 		mobile = css[css.index("@media (max-width: 760px)") :]
 		self.assertIn("overflow: auto", mobile)
 		self.assertIn("height: min(70vh, 640px)", mobile)
+
+	def test_css_bubbles_do_not_become_scroll_containers(self):
+		"""Message bubbles must expand to content; only .oc-messages scrolls."""
+		css = PLAIN_CSS.read_text(encoding="utf-8")
+		# Isolate the desktop bubble rule (before inbound/outbound modifiers).
+		bubble_start = css.index(".oc-bubble {")
+		bubble_end = css.index(".oc-bubble.inbound")
+		# Strip comments so prose cannot trip property assertions.
+		bubble = re.sub(r"/\*.*?\*/", "", css[bubble_start:bubble_end], flags=re.S)
+		self.assertIn("flex-shrink: 0", bubble)
+		self.assertIn("height: auto", bubble)
+		self.assertIn("max-height: none", bubble)
+		self.assertIn("overflow: visible", bubble)
+		# Single-axis overflow on a flex item forces the other axis to auto.
+		self.assertNotRegex(bubble, r"overflow-x\s*:")
+		self.assertNotRegex(bubble, r"overflow-y\s*:")
+		self.assertNotRegex(bubble, r"overflow\s*:\s*(auto|scroll|hidden)")
+		# Text nodes also stay non-scrollable.
+		text_block = re.sub(
+			r"/\*.*?\*/",
+			"",
+			css[css.index(".oc-bubble-text") : css.index(".oc-attach")],
+			flags=re.S,
+		)
+		self.assertIn("overflow: visible", text_block)
+		self.assertNotIn("overflow-y: auto", text_block)
+		self.assertNotIn("max-height", text_block)
 
 
 class TestRealtimeSoftRefreshContract(unittest.TestCase):
