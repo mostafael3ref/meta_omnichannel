@@ -246,6 +246,22 @@ class TestDeployedFrontendIsPlainBundle(unittest.TestCase):
 		# List uses the same primary-title helper (one title row).
 		self.assertIn("conversationPrimaryTitle(c)", js)
 
+	def test_plain_js_customer_panel_uses_primary_title(self):
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		self.assertIn("oc-customer-title", js)
+		self.assertIn("conversationPrimaryTitle(state.selected)", js)
+		self.assertIn("function patchPreservedCustomerTitle", js)
+		# Secondary line still shows provider / participant_id.
+		self.assertIn(
+			"`${state.selected.provider} / ${state.selected.participant_id}`",
+			js,
+		)
+		# Old bold participant_name HTML injection must be gone.
+		self.assertNotIn(
+			"html: `<strong>${state.selected.participant_name || \"\"}</strong>`",
+			js,
+		)
+
 
 class TestFrappeCallDoesNotDropMessageOnServerMessages(unittest.TestCase):
 	def test_plain_js_does_not_treat_server_messages_alone_as_failure(self):

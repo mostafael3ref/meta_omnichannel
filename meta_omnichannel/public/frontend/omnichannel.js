@@ -814,6 +814,12 @@
     else header.insertBefore(nextTitle, header.firstChild);
   }
 
+  function patchPreservedCustomerTitle(customerEl) {
+    if (!customerEl || !state.selected) return;
+    const strong = customerEl.querySelector(".oc-customer-title strong");
+    if (strong) strong.textContent = conversationPrimaryTitle(state.selected);
+  }
+
   function render(options) {
     const opts = options || {};
     const chrome = captureUiChrome();
@@ -926,6 +932,7 @@
       chat = reusedChat;
       patchPreservedChatHeader(chat);
       customer = reusedCustomer || el("aside", { className: "oc-customer" }, [el("h3", { text: t("customer") })]);
+      patchPreservedCustomerTitle(customer);
     } else {
       chat = el("section", { className: "oc-chat" });
       chat.appendChild(
@@ -981,7 +988,11 @@
       customer = el("aside", { className: "oc-customer" }, [el("h3", { text: t("customer") })]);
       if (!state.selected) customer.appendChild(el("div", { className: "oc-empty", text: t("empty_chat") }));
       else {
-        customer.appendChild(el("div", { html: `<strong>${state.selected.participant_name || ""}</strong>` }));
+        customer.appendChild(
+          el("div", { className: "oc-customer-title" }, [
+            el("strong", { text: conversationPrimaryTitle(state.selected) }),
+          ])
+        );
         customer.appendChild(
           el("div", { className: "channel-pill", text: `${state.selected.provider} / ${state.selected.participant_id}` })
         );
