@@ -18,6 +18,14 @@
       search: "Search conversations",
       sync: "Sync Facebook",
       send: "Send",
+      send_image: "Send image",
+      attach_image: "Attach image",
+      remove_image: "Remove",
+      image_only_hint: "Image is sent without the text draft",
+      image_type_rejected: "Use a JPEG, PNG, or GIF image",
+      image_too_large: "Image must be 8 MiB or smaller",
+      image_uncertain:
+        "Delivery is unconfirmed — the image may already have been sent. Remove this selection before choosing another image; do not resend.",
       composer_placeholder: "Write a message…",
       empty_list: "No conversations yet",
       empty_chat: "Select a conversation",
@@ -49,6 +57,14 @@
       search: "بحث في المحادثات",
       sync: "مزامنة فيسبوك",
       send: "إرسال",
+      send_image: "إرسال صورة",
+      attach_image: "إرفاق صورة",
+      remove_image: "إزالة",
+      image_only_hint: "تُرسل الصورة دون مسودة النص",
+      image_type_rejected: "استخدم صورة JPEG أو PNG أو GIF",
+      image_too_large: "يجب ألا تتجاوز الصورة 8 ميبيبايت",
+      image_uncertain:
+        "لم يُؤكَّد التسليم — ربما أُرسلت الصورة بالفعل. أزل هذا الاختيار قبل اختيار صورة أخرى؛ لا تعِد الإرسال.",
       composer_placeholder: "اكتب رسالة…",
       empty_list: "لا توجد محادثات",
       empty_chat: "اختر محادثة",
@@ -369,8 +385,151 @@
     return data.message;
   }
 
+  /**
+   * Authenticated multipart POST. Do not set Content-Type — the browser must
+   * supply the multipart boundary. CSRF still goes on the header.
+   */
+  async function callMultipart(method, fields, fileField, file) {
+    const body = new FormData();
+    Object.entries(fields || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null) return;
+      body.append(key, String(value));
+    });
+    if (fileField && file) {
+      body.append(fileField, file, file.name || "image");
+    }
+    const response = await fetch(`/api/method/${method}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "X-Frappe-CSRF-Token": csrf(),
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body,
+    });
+    const data = await response.json();
+    if (!response.ok || data.exc) {
+      throw new Error(frappeErrorMessage(data, data.exc || "Request failed"));
+    }
+    return data.message;
+  }
+
   function nonce() {
     return crypto.randomUUID ? crypto.randomUUID() : `n-${Date.now()}`;
+  }
+
+  const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
+  const ALLOWED_IMAGE_MIME = {
+    "image/jpeg": true,
+    "image/jpg": true,
+    "image/png": true,
+    "image/gif": true,
+  };
+
+  /** Per-conversation pending outbound image (File + stable nonce + object URL). */
+  const imageDrafts = Object.create(null);
+
+  function imageFileKey(file) {
+    if (!file) return "";
+    return [file.name || "", file.size || 0, file.lastModified || 0, file.type || ""].join("|");
+  }
+
+  function isAllowedComposerImage(file) {
+    if (!file) return false;
+    const mime = String(file.type || "")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (ALLOWED_IMAGE_MIME[mime]) return true;
+    const name = String(file.name || "").toLowerCase();
+    return /\.(jpe?g|png|gif)$/.test(name);
+  }
+
+  function revokeImagePreview(draft) {
+    if (!draft || !draft.previewUrl) return;
+    try {
+      if (typeof URL !== "undefined" && URL.revokeObjectURL) URL.revokeObjectURL(draft.previewUrl);
+    } catch (_) {}
+    draft.previewUrl = null;
+  }
+
+  function clearImageDraft(conversationName) {
+    const key = conversationName || "";
+    const draft = imageDrafts[key];
+    if (!draft) return;
+    revokeImagePreview(draft);
+    delete imageDrafts[key];
+  }
+
+  function clearAllImageDrafts() {
+    Object.keys(imageDrafts).forEach((key) => clearImageDraft(key));
+  }
+
+  function currentImageDraft() {
+    if (!state.selected || !state.selected.name) return null;
+    return imageDrafts[state.selected.name] || null;
+  }
+
+  function nonceForImage(conversationName, file) {
+    const key = imageFileKey(file);
+    const existing = imageDrafts[conversationName];
+    if (existing && existing.fileKey === key && existing.nonce) {
+      return existing.nonce;
+    }
+    return nonce();
+  }
+
+  function selectComposerImage(file) {
+    if (!state.selected || state.selected.provider !== "Facebook") return false;
+    if (state.sending) return false;
+    const conversationName = state.selected.name;
+    if (!file) return false;
+    if (!isAllowedComposerImage(file)) {
+      state.error = t("image_type_rejected");
+      render();
+      return false;
+    }
+    if ((file.size || 0) > MAX_COMPOSER_IMAGE_BYTES) {
+      state.error = t("image_too_large");
+      render();
+      return false;
+    }
+    const prev = imageDrafts[conversationName];
+    const fileKey = imageFileKey(file);
+    let nextNonce = nonce();
+    if (prev && prev.fileKey === fileKey && prev.nonce) nextNonce = prev.nonce;
+    if (prev) revokeImagePreview(prev);
+    let previewUrl = null;
+    try {
+      if (typeof URL !== "undefined" && URL.createObjectURL) {
+        previewUrl = URL.createObjectURL(file);
+      }
+    } catch (_) {
+      previewUrl = null;
+    }
+    imageDrafts[conversationName] = {
+      conversation: conversationName,
+      file: file,
+      fileKey: fileKey,
+      filename: file.name || "image",
+      mime: file.type || "",
+      size: file.size || 0,
+      previewUrl: previewUrl,
+      nonce: nextNonce,
+      blockResend: false,
+    };
+    state.error = "";
+    render();
+    return true;
+  }
+
+  function removeComposerImage() {
+    if (!state.selected || !state.selected.name) return;
+    if (state.sending) return;
+    clearImageDraft(state.selected.name);
+    state.error = "";
+    render();
   }
 
   function fmt(v) {
@@ -688,6 +847,7 @@
     pendingSoftMessageRefresh = null;
     pendingScrollToLatest = false;
     clearSendAttempt();
+    clearAllImageDrafts();
     sendGeneration += 1;
     state.error = t("empty_chat");
     messagesRefreshGen += 1;
@@ -837,6 +997,9 @@
     // Synchronous in-flight guard — second click cannot start another request.
     if (state.sending) return;
     if (!state.selected || state.selected.provider !== "Facebook") return;
+    // Image selection uses image-only send — never silently attach draft text.
+    const pendingImage = currentImageDraft();
+    if (pendingImage && pendingImage.file) return;
     const text = (state.draft || "").trim();
     if (!text) return;
 
@@ -883,6 +1046,79 @@
       state.sending = false;
       render();
     }
+  }
+
+  async function sendImageMessage() {
+    if (state.sending) return;
+    if (!state.selected || state.selected.provider !== "Facebook") return;
+    const conversationName = state.selected.name;
+    const draft = imageDrafts[conversationName];
+    if (!draft || !draft.file) return;
+    if (draft.blockResend) {
+      state.error = t("image_uncertain");
+      render();
+      return;
+    }
+
+    const clientNonce = draft.nonce || nonceForImage(conversationName, draft.file);
+    draft.nonce = clientNonce;
+    const fileKey = draft.fileKey;
+    const myGen = ++sendGeneration;
+    state.sending = true;
+    state.error = "";
+    render();
+    try {
+      const result = await callMultipart(
+        "meta_omnichannel.api.inbox.send_image_message",
+        {
+          conversation: conversationName,
+          client_nonce: clientNonce,
+        },
+        "image",
+        draft.file
+      );
+      // Stale: switched conversation or replaced the image selection mid-flight.
+      if (myGen !== sendGeneration) return;
+      if (!state.selected || state.selected.name !== conversationName) return;
+      const still = imageDrafts[conversationName];
+      if (!still || still.fileKey !== fileKey || still.nonce !== clientNonce) return;
+
+      if (result && result.ok) {
+        clearImageDraft(conversationName);
+        // Keep text draft intact — captions are unsupported.
+        state.error = "";
+        await openConversation(state.selected);
+        await loadList();
+        return;
+      }
+
+      if (result && result.uncertain) {
+        still.blockResend = true;
+        state.error = t("image_uncertain");
+      } else {
+        state.error = (result && result.error) || "Send failed";
+      }
+      render();
+    } catch (e) {
+      if (myGen !== sendGeneration) return;
+      if (!state.selected || state.selected.name !== conversationName) return;
+      const still = imageDrafts[conversationName];
+      if (!still || still.fileKey !== fileKey || still.nonce !== clientNonce) return;
+      state.error = e.message || String(e);
+      render();
+    } finally {
+      state.sending = false;
+      render();
+    }
+  }
+
+  function sendComposer() {
+    if (state.sending) return;
+    const img = currentImageDraft();
+    if (img && img.file) {
+      return sendImageMessage();
+    }
+    return sendMessage();
   }
 
   function patchPreservedChatHeader(chatEl) {
@@ -1046,6 +1282,79 @@
       const composer = el("div", { className: "oc-composer" });
       const canCompose =
         !!state.selected && state.selected.provider === "Facebook" && !state.sending;
+      const imageDraft = currentImageDraft();
+      const hasImage = !!(imageDraft && imageDraft.file);
+      const imageBlocked = !!(hasImage && imageDraft.blockResend);
+      const canSend =
+        canCompose && !imageBlocked && (hasImage || !!(state.draft || "").trim());
+
+      if (hasImage) {
+        const preview = el("div", { className: "oc-composer-preview" });
+        if (imageDraft.previewUrl) {
+          preview.appendChild(
+            el("img", {
+              className: "oc-composer-thumb",
+              src: imageDraft.previewUrl,
+              alt: imageDraft.filename || "Image",
+            })
+          );
+        }
+        preview.appendChild(
+          el("div", { className: "oc-composer-preview-meta" }, [
+            el("div", {
+              className: "oc-composer-filename",
+              text: imageDraft.filename || "image",
+            }),
+            el("div", { className: "oc-composer-hint", text: t("image_only_hint") }),
+          ])
+        );
+        preview.appendChild(
+          el("button", {
+            className: "oc-btn secondary oc-composer-remove",
+            type: "button",
+            text: t("remove_image"),
+            disabled: state.sending,
+            onclick: removeComposerImage,
+          })
+        );
+        composer.appendChild(preview);
+      }
+
+      const isFacebook = !!(state.selected && state.selected.provider === "Facebook");
+      const row = el("div", {
+        className: "oc-composer-row" + (isFacebook ? " has-attach" : ""),
+      });
+      let fileInput = null;
+      if (isFacebook) {
+        fileInput = el("input", {
+          className: "oc-composer-file",
+          type: "file",
+          accept: "image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif",
+          disabled: !canCompose,
+          onchange: (e) => {
+            const input = e && e.target;
+            const file =
+              input && input.files && input.files.length ? input.files[0] : null;
+            if (file) selectComposerImage(file);
+            if (input) input.value = "";
+          },
+        });
+        composer.appendChild(fileInput);
+        row.appendChild(
+          el("button", {
+            className: "oc-btn secondary oc-composer-attach",
+            type: "button",
+            text: "＋",
+            title: t("attach_image"),
+            "aria-label": t("attach_image"),
+            disabled: !canCompose,
+            onclick: () => {
+              if (!canCompose || !fileInput) return;
+              fileInput.click();
+            },
+          })
+        );
+      }
       const ta = el("textarea", {
         rows: "3",
         placeholder: t("composer_placeholder"),
@@ -1055,16 +1364,17 @@
           onDraftInput(e.target.value);
         },
       });
-      composer.appendChild(ta);
-      composer.appendChild(
+      row.appendChild(ta);
+      row.appendChild(
         el("button", {
           className: "oc-btn",
           type: "button",
-          text: t("send"),
-          disabled: !canCompose,
-          onclick: sendMessage,
+          text: hasImage ? t("send_image") : t("send"),
+          disabled: !canSend,
+          onclick: sendComposer,
         })
       );
+      composer.appendChild(row);
       chat.appendChild(composer);
       if (state.selected && state.selected.provider !== "Facebook") {
         chat.appendChild(el("div", { className: "oc-empty", text: t("pending_channel") }));
@@ -1330,6 +1640,10 @@
     softLoadList: softLoadList,
     openConversation: openConversation,
     sendMessage: sendMessage,
+    sendImageMessage: sendImageMessage,
+    sendComposer: sendComposer,
+    selectComposerImage: selectComposerImage,
+    removeComposerImage: removeComposerImage,
     drainPendingSoftMessageRefresh: drainPendingSoftMessageRefresh,
     getPendingSoftMessageRefresh: function () {
       return pendingSoftMessageRefresh;
@@ -1339,6 +1653,25 @@
     },
     getSendAttemptNonce: function () {
       return sendAttempt.nonce;
+    },
+    getImageAttemptNonce: function () {
+      const draft = currentImageDraft();
+      return draft ? draft.nonce : null;
+    },
+    getImageDraft: function () {
+      const draft = currentImageDraft();
+      if (!draft) return null;
+      return {
+        conversation: draft.conversation,
+        filename: draft.filename,
+        mime: draft.mime,
+        size: draft.size,
+        fileKey: draft.fileKey,
+        nonce: draft.nonce,
+        blockResend: !!draft.blockResend,
+        hasFile: !!draft.file,
+        previewUrl: draft.previewUrl || null,
+      };
     },
     getState: function () {
       return {
@@ -1353,6 +1686,7 @@
         messageCount: state.messages.length,
         conversationCount: state.conversations.length,
         panel: state.panel,
+        hasImageDraft: !!(currentImageDraft() && currentImageDraft().file),
       };
     },
     isSubscribed: function () {

@@ -8,6 +8,8 @@ from urllib.parse import quote
 
 from meta_omnichannel.facebook_messenger.adapter import (
 	MAX_ATTACHMENT_BYTES,
+	MAX_OUTBOUND_IMAGE_BYTES,
+	SEND_IMAGE_PATH,
 	FacebookConnectorAdapter,
 )
 from meta_omnichannel.meta_connectors.errors import (
@@ -16,6 +18,7 @@ from meta_omnichannel.meta_connectors.errors import (
 	ConnectorForbiddenError,
 	ConnectorRateLimitError,
 	ConnectorServerError,
+	ConnectorUnreachableError,
 )
 from meta_omnichannel.utils.idempotency import build_outbound_idempotency_key
 
@@ -265,6 +268,181 @@ class TestGetMessageAttachment(unittest.TestCase):
 		r.content = b"{}"
 		r.json.return_value = payload
 		return r
+
+
+class TestSendImage(unittest.TestCase):
+	def setUp(self):
+		self.client = MagicMock()
+		self.adapter = FacebookConnectorAdapter(client=self.client)
+		self.png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+	def _resp(self, status, payload):
+		r = MagicMock()
+		r.status_code = status
+		r.content = b"{}"
+		r.json.return_value = payload
+		return r
+
+	def test_send_image_multipart_contract(self):
+		self.client.request.return_value = self._resp(
+			200,
+			{"status": "sent", "page_id": "P1", "message_id": "m_1", "duplicate": False},
+		)
+		out = self.adapter.send_image(
+			page_id="P1",
+			recipient_id="S1",
+			idempotency_key="idem-1",
+			image_bytes=self.png,
+			filename="photo.png",
+			content_type="image/png",
+		)
+		self.assertEqual(out["status"], "sent")
+		self.assertEqual(out["message_id"], "m_1")
+		args, kwargs = self.client.request.call_args
+		self.assertEqual(args[0], "POST")
+		self.assertEqual(args[1], SEND_IMAGE_PATH)
+		self.assertEqual(SEND_IMAGE_PATH, "/api/facebook/messages/send-image")
+		self.assertIsNone(kwargs.get("json_body"))
+		self.assertEqual(
+			kwargs["data"],
+			{"page_id": "P1", "recipient_id": "S1", "idempotency_key": "idem-1"},
+		)
+		name, body, mime = kwargs["files"]["image"]
+		self.assertEqual(name, "photo.png")
+		self.assertEqual(body, self.png)
+		self.assertEqual(mime, "image/png")
+		self.assertEqual(self.client.request.call_count, 1)
+
+	def test_send_text_regression_still_json(self):
+		self.client.request.return_value = self._resp(200, {"ok": True})
+		self.adapter.send_text(
+			page_id="P1", recipient_id="S1", text="Hi", idempotency_key="k1"
+		)
+		kwargs = self.client.request.call_args.kwargs
+		self.assertEqual(self.client.request.call_args.args[1], "/api/facebook/messages/send")
+		self.assertIn("json_body", kwargs)
+		self.assertNotIn("files", kwargs)
+
+	def test_rejects_unsupported_mime_before_request(self):
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=self.png,
+				filename="x.webp",
+				content_type="image/webp",
+			)
+		self.assertIn("content_type", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_oversized_image_before_request(self):
+		huge = b"\x00" * (MAX_OUTBOUND_IMAGE_BYTES + 1)
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=huge,
+				filename="big.jpg",
+				content_type="image/jpeg",
+			)
+		self.assertIn("8 mib", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_image_jpg_alias_normalized(self):
+		self.client.request.return_value = self._resp(
+			200, {"status": "sent", "message_id": "m", "duplicate": False}
+		)
+		self.adapter.send_image(
+			page_id="P1",
+			recipient_id="S1",
+			idempotency_key="k",
+			image_bytes=self.png,
+			filename="a.jpg",
+			content_type="image/jpg",
+		)
+		_name, _body, mime = self.client.request.call_args.kwargs["files"]["image"]
+		self.assertEqual(mime, "image/jpeg")
+
+	def test_http_400_is_definitive_error(self):
+		self.client.request.return_value = self._resp(400, {"detail": "invalid"})
+		with self.assertRaises(ConnectorError):
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=self.png,
+				filename="a.png",
+				content_type="image/png",
+			)
+
+	def test_http_403_is_forbidden(self):
+		self.client.request.return_value = self._resp(403, {})
+		with self.assertRaises(ConnectorForbiddenError):
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=self.png,
+				filename="a.png",
+				content_type="image/png",
+			)
+
+	def test_http_409_is_definitive_error(self):
+		self.client.request.return_value = self._resp(409, {"detail": "conflict"})
+		with self.assertRaises(ConnectorError):
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=self.png,
+				filename="a.png",
+				content_type="image/png",
+			)
+
+	def test_http_502_is_server_error_for_unknown_mapping(self):
+		self.client.request.return_value = self._resp(502, {})
+		with self.assertRaises(ConnectorServerError):
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=self.png,
+				filename="a.png",
+				content_type="image/png",
+			)
+
+	def test_timeout_unreachable_no_retry(self):
+		self.client.request.side_effect = ConnectorUnreachableError(
+			"Connector request timed out"
+		)
+		with self.assertRaises(ConnectorUnreachableError):
+			self.adapter.send_image(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				image_bytes=self.png,
+				filename="a.png",
+				content_type="image/png",
+			)
+		self.assertEqual(self.client.request.call_count, 1)
+
+	def test_duplicate_true_response_returned(self):
+		self.client.request.return_value = self._resp(
+			200,
+			{"status": "sent", "message_id": "m_dup", "duplicate": True},
+		)
+		out = self.adapter.send_image(
+			page_id="P1",
+			recipient_id="S1",
+			idempotency_key="k",
+			image_bytes=self.png,
+			filename="a.png",
+			content_type="image/png",
+		)
+		self.assertTrue(out["duplicate"])
+		self.assertEqual(out["message_id"], "m_dup")
 
 
 if __name__ == "__main__":

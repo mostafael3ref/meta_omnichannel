@@ -772,3 +772,92 @@ def persist_message_attachment(
 		return persist_message_attachment_unlocked(
 			message_name, index, lock_handle=lock
 		)
+
+
+def attach_outbound_image_file(
+	message_name: str,
+	content: bytes,
+	content_type: str,
+	*,
+	attachment_index: int = 0,
+) -> dict[str, Any]:
+	"""Persist outbound image bytes as a private File + Ready child row.
+
+	Does not call the Connector or commit/rollback. Reuses an existing Ready File
+	with the same content hash. Never returns ``file_url``.
+	"""
+	message_name = (message_name or "").strip()
+	index = _parse_attachment_index(attachment_index)
+	if not message_name:
+		frappe.throw(_("Omnichannel Message {0} not found").format(message_name), frappe.ValidationError)
+	if not isinstance(content, (bytes, bytearray)) or not bytes(content):
+		frappe.throw(_("Outbound image content is required"), frappe.ValidationError)
+
+	payload = bytes(content)
+	mime = (content_type or "").split(";", 1)[0].strip().lower()
+	if not mime:
+		frappe.throw(_("Outbound image MIME type is required"), frappe.ValidationError)
+
+	_load_message(message_name)
+	content_hash = _sha256_hex(payload)
+	existing_file = _find_existing_file_for_hash(message_name, content_hash)
+	row = _get_child_row(message_name, index)
+	if (
+		row is not None
+		and (row.status or "") == "Ready"
+		and (row.content_hash or "") == content_hash
+		and _file_is_valid_private(row.file, message_name)
+	):
+		return _result(
+			ok=True,
+			message=message_name,
+			attachment_index=index,
+			status="Ready",
+			file=row.file,
+			content_hash=content_hash,
+		)
+
+	child_name = _ensure_pending_child(message_name, index, row)
+	created_file_name: str | None = None
+	try:
+		file_name = existing_file
+		if not file_name:
+			fname = _safe_filename(message_name, index, mime)
+			file_doc = save_file(
+				fname,
+				payload,
+				MESSAGE_DOCTYPE,
+				message_name,
+				is_private=1,
+				df=CHILD_PARENTFIELD,
+			)
+			created_file_name = file_doc.name
+			_ensure_system_owned_private(file_doc, message_name)
+			file_name = file_doc.name
+
+		if not _file_is_valid_private(file_name, message_name):
+			frappe.throw(
+				_("Saved File is missing or not a valid private attachment"),
+				frappe.ValidationError,
+			)
+
+		_mark_child_ready(
+			child_name,
+			attachment_type=_attachment_type_from_mime(mime),
+			mime_type=mime,
+			file_name=file_name,
+			content_hash=content_hash,
+		)
+		created_file_name = None
+		return _result(
+			ok=True,
+			message=message_name,
+			attachment_index=index,
+			status="Ready",
+			file=file_name,
+			content_hash=content_hash,
+		)
+	except Exception as exc:
+		_mark_child_failed(child_name, _sanitize_error(exc))
+		_delete_new_file_best_effort(created_file_name)
+		raise

@@ -141,6 +141,56 @@ class TestConnectorClient(unittest.TestCase):
 		with self.assertRaises(ConnectorError):
 			ConnectorClient(base_url="https://connect.tarteebagency.com", api_key="")
 
+	def test_multipart_does_not_force_json_content_type(self):
+		self.session.request.return_value = self._mock_response(200)
+		png = b"\x89PNG\r\n\x1a\n" + b"x" * 16
+		self.client.request(
+			"POST",
+			"/api/facebook/messages/send-image",
+			data={
+				"page_id": "P1",
+				"recipient_id": "S1",
+				"idempotency_key": "k1",
+			},
+			files={"image": ("photo.png", png, "image/png")},
+		)
+		kwargs = self.session.request.call_args.kwargs
+		self.assertEqual(kwargs["method"], "POST")
+		self.assertEqual(kwargs["url"], "https://1.2.3.4/api/facebook/messages/send-image")
+		self.assertEqual(kwargs["headers"]["X-API-Key"], "secret-test-key")
+		self.assertNotEqual(kwargs["headers"].get("Content-Type"), "application/json")
+		self.assertNotIn("json", kwargs)
+		self.assertEqual(kwargs["data"]["idempotency_key"], "k1")
+		self.assertIn("files", kwargs)
+		name, body, mime = kwargs["files"]["image"]
+		self.assertEqual(name, "photo.png")
+		self.assertEqual(body, png)
+		self.assertEqual(mime, "image/png")
+		# Single attempt — client never retries.
+		self.assertEqual(self.session.request.call_count, 1)
+
+	def test_json_body_and_files_mutually_exclusive(self):
+		with self.assertRaises(ConnectorError):
+			self.client.request(
+				"POST",
+				"/api/facebook/messages/send-image",
+				json_body={"a": 1},
+				files={"image": ("a.png", b"x", "image/png")},
+			)
+		self.session.request.assert_not_called()
+
+	def test_json_request_still_sets_application_json(self):
+		self.session.request.return_value = self._mock_response(200)
+		self.client.request(
+			"POST",
+			"/api/facebook/messages/send",
+			json_body={"page_id": "P1", "text": "hi", "recipient_id": "S1", "idempotency_key": "k"},
+		)
+		kwargs = self.session.request.call_args.kwargs
+		self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
+		self.assertEqual(kwargs["json"]["text"], "hi")
+		self.assertNotIn("files", kwargs)
+
 
 if __name__ == "__main__":
 	unittest.main()

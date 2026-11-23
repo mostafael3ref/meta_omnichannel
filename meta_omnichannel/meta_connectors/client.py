@@ -87,11 +87,25 @@ class ConnectorClient:
 		*,
 		params: dict[str, Any] | None = None,
 		json_body: dict[str, Any] | None = None,
+		data: dict[str, Any] | None = None,
+		files: Any | None = None,
 	) -> requests.Response:
-		"""Perform a connector request to a DNS-pinned, validated destination IP."""
+		"""Perform a connector request to a DNS-pinned, validated destination IP.
+
+		``json_body`` sets ``Content-Type: application/json``. Multipart uploads pass
+		``files`` (and optional form ``data``); do not set Content-Type so ``requests``
+		generates the multipart boundary. ``json_body`` and ``files`` are mutually exclusive.
+		"""
+		if json_body is not None and files is not None:
+			raise ConnectorError(
+				"Connector request cannot combine json_body with multipart files",
+				connection_status="Misconfigured",
+			)
+
 		destination = resolve_safe_destination(self.base_url)
 		pinned_url = build_pinned_request_url(destination, path)
 		base_headers = self._headers()
+		# Multipart: never force Content-Type — requests must set boundary.
 		if json_body is not None:
 			base_headers = {**base_headers, "Content-Type": "application/json"}
 		headers = pinned_request_headers(destination, base_headers)
@@ -114,6 +128,10 @@ class ConnectorClient:
 		}
 		if json_body is not None:
 			request_kwargs["json"] = json_body
+		if data is not None:
+			request_kwargs["data"] = data
+		if files is not None:
+			request_kwargs["files"] = files
 		assert_tls_verify_enabled(request_kwargs)
 
 		try:

@@ -760,13 +760,43 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("clearSendAttempt()", js)
 		self.assertIn("client_nonce: clientNonce", js)
 		# Draft cleared only on confirmed success — not on every HTTP 200.
-		send_fn = js[js.index("async function sendMessage") : js.index("function patchPreservedChatHeader")]
+		send_fn = js[js.index("async function sendMessage") : js.index("async function sendImageMessage")]
 		self.assertIn("result && result.ok", send_fn)
 		self.assertIn("state.draft = \"\"", send_fn)
 		self.assertIn("result.uncertain", send_fn)
 		self.assertIn("myGen !== sendGeneration", send_fn)
 		# Composer disables while sending.
 		self.assertIn("!state.sending", js)
+
+	def test_send_image_composer_wiring(self):
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		self.assertIn("function callMultipart", js)
+		self.assertIn("meta_omnichannel.api.inbox.send_image_message", js)
+		self.assertIn('body.append(fileField, file, file.name || "image")', js)
+		# Never force multipart Content-Type (browser sets boundary).
+		multipart = js[js.index("async function callMultipart") : js.index("function nonce()")]
+		self.assertNotIn("Content-Type", multipart)
+		self.assertIn("X-Frappe-CSRF-Token", multipart)
+		self.assertIn("credentials: \"same-origin\"", multipart)
+		self.assertIn("function selectComposerImage", js)
+		self.assertIn("function sendImageMessage", js)
+		self.assertIn("function sendComposer", js)
+		self.assertIn("imageDrafts", js)
+		self.assertIn("MAX_COMPOSER_IMAGE_BYTES", js)
+		self.assertIn("blockResend", js)
+		self.assertIn("image_only_hint", js)
+		self.assertIn("oc-composer-attach", js)
+		self.assertIn("accept: \"image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif\"", js)
+		# Captions unsupported — image send must not append draft text.
+		img_fn = js[js.index("async function sendImageMessage") : js.index("function sendComposer")]
+		self.assertNotIn("text:", img_fn)
+		self.assertNotIn("state.draft", img_fn)
+		self.assertIn("Keep text draft intact", img_fn)
+		css = (ROOT / "meta_omnichannel" / "public" / "frontend" / "omnichannel.css").read_text(
+			encoding="utf-8"
+		)
+		self.assertIn(".oc-composer-preview", css)
+		self.assertIn(".oc-composer-row.has-attach", css)
 
 
 def _find_node_executable() -> Optional[str]:
@@ -882,11 +912,39 @@ function createEl(tag) {
       if (sandbox.document.activeElement === node) sandbox.document.activeElement = null;
     },
     setSelectionRange(a, b) { node.selectionStart = a; node.selectionEnd = b; },
+    click() {
+      const fns = listeners.click || [];
+      fns.forEach((fn) => fn({ type: "click", target: node }));
+    },
+    files: null,
     querySelector(sel) { return queryOne(node, sel); },
     querySelectorAll(sel) { return queryAll(node, sel); },
     _listeners: listeners,
   };
   return node;
+}
+
+class FakeFormData {
+  constructor() { this._entries = []; }
+  append(key, value, filename) {
+    this._entries.push([String(key), value, filename]);
+  }
+  get(key) {
+    const hit = this._entries.find((e) => e[0] === String(key));
+    return hit ? hit[1] : null;
+  }
+  has(key) { return this._entries.some((e) => e[0] === String(key)); }
+  entries() { return this._entries.slice(); }
+}
+
+function makeImageFile(overrides) {
+  const o = overrides || {};
+  return {
+    name: o.name || "photo.png",
+    size: o.size != null ? o.size : 64,
+    type: o.type || "image/png",
+    lastModified: o.lastModified || 1,
+  };
 }
 
 function matchSel(node, sel) {
@@ -940,7 +998,7 @@ const root = createEl("div");
 root.id = "omnichannel-app";
 root.querySelector = (sel) => queryOne(root, sel);
 
-const gate = { list: [], messages: [], panel: [], send: [] };
+const gate = { list: [], messages: [], panel: [], send: [], sendImage: [] };
 let nonceSeq = 0;
 function defer() {
   let settled = false;
@@ -1060,6 +1118,8 @@ const sandbox = {
   csrf_token: "t",
   omnichannelBoot: { lang: "en", user: "agent@example.com", csrf_token: "t" },
   frappe: { realtime: realtime },
+  FormData: FakeFormData,
+  URL: URL,
   crypto: {
     randomUUID() {
       nonceSeq += 1;
@@ -1073,8 +1133,31 @@ const sandbox = {
     querySelector(sel) { return queryOne(root, sel); },
   },
   fetch: async (url, opts) => {
-    const params = new URLSearchParams(opts.body);
     const path = String(url || "");
+    const headers = (opts && opts.headers) || {};
+    if (path.indexOf("send_image_message") !== -1) {
+      const body = opts && opts.body;
+      assert.ok(body && typeof body.get === "function", "FormData body required");
+      assert.strictEqual(
+        headers["Content-Type"],
+        undefined,
+        "must not set multipart Content-Type manually"
+      );
+      assert.ok(headers["X-Frappe-CSRF-Token"], "CSRF required");
+      const entry = {
+        conversation: body.get("conversation") || "",
+        client_nonce: body.get("client_nonce") || "",
+        image: body.get("image"),
+        text: body.get("text"),
+        headers: headers,
+        credentials: opts.credentials,
+        d: defer(),
+      };
+      gate.sendImage.push(entry);
+      const payload = await entry.d;
+      return { ok: true, json: async () => ({ message: payload }) };
+    }
+    const params = new URLSearchParams(opts.body);
     if (path.indexOf("list_conversations") !== -1) {
       const entry = { search: params.get("search") || "", d: defer() };
       gate.list.push(entry);
@@ -1110,6 +1193,15 @@ const sandbox = {
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 sandbox.self = sandbox;
+// Always stub object URLs — Node's createObjectURL rejects plain file mocks.
+(function () {
+  let blobSeq = 0;
+  sandbox.URL.createObjectURL = function () {
+    blobSeq += 1;
+    return "blob:mock-" + blobSeq;
+  };
+  sandbox.URL.revokeObjectURL = function () {};
+})();
 
 vm.createContext(sandbox);
 // Load published source, then inject test-only mutators in-memory only (never shipped).
@@ -1140,6 +1232,8 @@ assert.strictEqual(typeof api.bumpMessagesRefreshGen, "function");
 assert.strictEqual(typeof api.setSearch, "function");
 assert.strictEqual(typeof api.setDraft, "function");
 assert.strictEqual(typeof api.sendMessage, "function");
+assert.strictEqual(typeof api.sendImageMessage, "function");
+assert.strictEqual(typeof api.selectComposerImage, "function");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function waitUntil(fn, label, tries = 100) {
@@ -1151,10 +1245,12 @@ async function waitUntil(fn, label, tries = 100) {
 }
 
 async function openReadyConversation(row, messages) {
+  const msgBefore = gate.messages.length;
+  const panelBefore = gate.panel.length;
   const openP = api.openConversation(row);
-  await waitUntil(() => gate.messages.length >= 1, "open messages");
+  await waitUntil(() => gate.messages.length > msgBefore, "open messages");
   gate.messages[gate.messages.length - 1].d.resolve(messages || []);
-  await waitUntil(() => gate.panel.length >= 1, "open panel");
+  await waitUntil(() => gate.panel.length > panelBefore, "open panel");
   gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
   await openP;
 }
@@ -1831,6 +1927,209 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "image_select_preview_and_reject") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "ok.png", type: "image/png", size: 128 })));
+    const draft = api.getImageDraft();
+    assert.ok(draft && draft.hasFile);
+    assert.strictEqual(draft.filename, "ok.png");
+    assert.ok(draft.previewUrl);
+    assert.ok(api.getImageAttemptNonce());
+    assert.ok(root.querySelector(".oc-composer-preview"), "preview rendered");
+    assert.ok(root.querySelector(".oc-composer-attach"), "attach control");
+    assert.strictEqual(api.selectComposerImage(makeImageFile({ name: "x.webp", type: "image/webp", size: 10 })), false);
+    assert.ok(String(api.getState().error || "").length > 0, "reject bad mime");
+    assert.strictEqual(api.selectComposerImage(makeImageFile({ name: "big.png", type: "image/png", size: 8 * 1024 * 1024 + 1 })), false);
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("8") >= 0);
+    console.log("OK image_select_preview_and_reject");
+    return;
+  }
+
+  if (scenario === "image_send_multipart_csrf_and_dedupe") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("caption must not go");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "shot.jpg", type: "image/jpeg", size: 200 })));
+    const nonce1 = api.getImageAttemptNonce();
+    const p1 = api.sendComposer();
+    const p2 = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "image send");
+    assert.strictEqual(gate.sendImage.length, 1, "duplicate click blocked");
+    assert.strictEqual(gate.send.length, 0, "text send unused");
+    assert.strictEqual(gate.sendImage[0].client_nonce, nonce1);
+    assert.strictEqual(gate.sendImage[0].conversation, "CONV-A");
+    assert.ok(gate.sendImage[0].image);
+    assert.strictEqual(gate.sendImage[0].text, null, "no caption field");
+    assert.strictEqual(gate.sendImage[0].credentials, "same-origin");
+    assert.ok(gate.sendImage[0].headers["X-Frappe-CSRF-Token"]);
+    const settle = settlePostSendRefresh();
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await p1;
+    await p2;
+    await settle;
+    assert.strictEqual(api.getState().hasImageDraft, false, "cleared on success");
+    assert.strictEqual(api.getState().draft, "caption must not go", "text draft preserved");
+    assert.strictEqual(api.getImageAttemptNonce(), null);
+    console.log("OK image_send_multipart_csrf_and_dedupe");
+    return;
+  }
+
+  if (scenario === "image_failed_keeps_selection") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "fail.png", type: "image/png", size: 40 })));
+    const nonce1 = api.getImageAttemptNonce();
+    const p = api.sendImageMessage();
+    await waitUntil(() => gate.sendImage.length >= 1, "fail send");
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle fail");
+    assert.strictEqual(api.getState().hasImageDraft, true);
+    assert.strictEqual(api.getImageAttemptNonce(), nonce1);
+    assert.ok(api.getState().error);
+    const p2 = api.sendImageMessage();
+    await waitUntil(() => gate.sendImage.length >= 2, "retry");
+    assert.strictEqual(gate.sendImage[1].client_nonce, nonce1);
+    gate.sendImage[1].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: true,
+    });
+    await p2;
+    await waitUntil(() => api.getState().sending === false, "idle retry");
+    console.log("OK image_failed_keeps_selection");
+    return;
+  }
+
+  if (scenario === "image_uncertain_blocks_resend") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "maybe.png", type: "image/png", size: 40 })));
+    const p = api.sendImageMessage();
+    await waitUntil(() => gate.sendImage.length >= 1, "uncertain send");
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle uncertain");
+    assert.strictEqual(api.getState().hasImageDraft, true);
+    assert.ok(api.getImageDraft().blockResend);
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("unconfirmed") >= 0);
+    await api.sendImageMessage();
+    assert.strictEqual(gate.sendImage.length, 1, "no one-click resend after Unknown");
+    console.log("OK image_uncertain_blocks_resend");
+    return;
+  }
+
+  if (scenario === "image_switch_conversation_ignores_stale") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    // Seed B's image draft first (per-conversation map), then send from A.
+    await openReadyConversation(rowB, []);
+    api.setDraft("text B");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "b.png", type: "image/png", size: 30 })));
+    await openReadyConversation(rowA, []);
+    api.setDraft("text A");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "a.png", type: "image/png", size: 20 })));
+    const pSend = api.sendImageMessage();
+    await waitUntil(() => gate.sendImage.length >= 1, "image A");
+    const msgBefore = gate.messages.length;
+    const panelBefore = gate.panel.length;
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length > msgBefore, "reopen B messages");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBefore, "reopen B panel");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    api.setDraft("text B newer");
+    assert.strictEqual(api.getImageDraft().filename, "b.png", "B preview restored from map");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-A",
+      deduplicated: false,
+    });
+    await pSend;
+    await waitUntil(() => api.getState().sending === false, "send finished");
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    assert.strictEqual(api.getState().draft, "text B newer", "stale image success must not clear B draft");
+    assert.strictEqual(api.getState().hasImageDraft, true, "B image kept");
+    assert.strictEqual(api.getImageDraft().filename, "b.png");
+    console.log("OK image_switch_conversation_ignores_stale");
+    return;
+  }
+
+  if (scenario === "image_instagram_no_attach") {
+    const row = {
+      name: "CONV-IG",
+      participant_name: "IG",
+      provider: "Instagram",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.strictEqual(api.selectComposerImage(makeImageFile({})), false);
+    assert.ok(!root.querySelector(".oc-composer-attach"));
+    console.log("OK image_instagram_no_attach");
+    return;
+  }
+
   throw new Error("unknown scenario " + scenario);
 })().catch((err) => {
   console.error(err && err.stack ? err.stack : err);
@@ -1933,6 +2232,30 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_send_switch_conversation_ignores_stale(self):
 		out = self._run_scenario("send_switch_conversation_ignores_stale")
 		self.assertIn("OK send_switch_conversation_ignores_stale", out)
+
+	def test_image_select_preview_and_reject(self):
+		out = self._run_scenario("image_select_preview_and_reject")
+		self.assertIn("OK image_select_preview_and_reject", out)
+
+	def test_image_send_multipart_csrf_and_dedupe(self):
+		out = self._run_scenario("image_send_multipart_csrf_and_dedupe")
+		self.assertIn("OK image_send_multipart_csrf_and_dedupe", out)
+
+	def test_image_failed_keeps_selection(self):
+		out = self._run_scenario("image_failed_keeps_selection")
+		self.assertIn("OK image_failed_keeps_selection", out)
+
+	def test_image_uncertain_blocks_resend(self):
+		out = self._run_scenario("image_uncertain_blocks_resend")
+		self.assertIn("OK image_uncertain_blocks_resend", out)
+
+	def test_image_switch_conversation_ignores_stale(self):
+		out = self._run_scenario("image_switch_conversation_ignores_stale")
+		self.assertIn("OK image_switch_conversation_ignores_stale", out)
+
+	def test_image_instagram_no_attach(self):
+		out = self._run_scenario("image_instagram_no_attach")
+		self.assertIn("OK image_instagram_no_attach", out)
 
 
 if __name__ == "__main__":

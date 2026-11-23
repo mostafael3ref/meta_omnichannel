@@ -355,6 +355,79 @@ def send_message(conversation: str, text: str, client_nonce: str) -> dict:
 	)
 
 
+def _read_upload_image_bounded(upload, *, max_bytes: int) -> tuple[bytes, str | None, str | None]:
+	"""Read at most ``max_bytes + 1`` from the upload stream (reject oversized)."""
+	filename = getattr(upload, "filename", None) or getattr(upload, "name", None)
+	content_type = getattr(upload, "content_type", None) or getattr(upload, "mimetype", None)
+	stream = getattr(upload, "stream", None)
+	if stream is not None and hasattr(stream, "read"):
+		data = stream.read(max_bytes + 1)
+	elif hasattr(upload, "read"):
+		data = upload.read(max_bytes + 1)
+	else:
+		frappe.throw(_("Image upload is required"), frappe.ValidationError)
+	if data is None:
+		data = b""
+	if not isinstance(data, (bytes, bytearray)):
+		data = bytes(data)
+	else:
+		data = bytes(data)
+	if len(data) > max_bytes:
+		frappe.throw(_("Image exceeds 8 MiB limit"), frappe.ValidationError)
+	if not data:
+		frappe.throw(_("Image upload is required"), frappe.ValidationError)
+	return data, (str(filename).strip() if filename else None), (
+		str(content_type).strip() if content_type else None
+	)
+
+
+@frappe.whitelist()
+def send_image_message(
+	conversation: str, client_nonce: str, filename: str | None = None
+) -> dict:
+	"""Send one Facebook Messenger image from multipart field ``image``."""
+	ensure_omnichannel_agent()
+	client_nonce = (client_nonce or "").strip()
+	if not client_nonce:
+		frappe.throw(_("client_nonce is required"), frappe.ValidationError)
+
+	conv = frappe.get_doc("Omnichannel Conversation", conversation)
+	if not has_conversation_permission(conv, "write"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	if conv.provider != "Facebook":
+		frappe.throw(
+			_("Outbound messaging for {0} is not available until the connector API is confirmed").format(
+				conv.provider
+			)
+		)
+
+	files = getattr(getattr(frappe, "request", None), "files", None) or {}
+	upload = None
+	if hasattr(files, "get"):
+		upload = files.get("image")
+	elif isinstance(files, dict):
+		upload = files.get("image")
+	if upload is None:
+		frappe.throw(_("Image upload is required"), frappe.ValidationError)
+
+	from meta_omnichannel.facebook_messenger.adapter import MAX_OUTBOUND_IMAGE_BYTES
+	from meta_omnichannel.facebook_messenger.outbound import send_facebook_image
+
+	image_bytes, upload_name, upload_mime = _read_upload_image_bounded(
+		upload, max_bytes=MAX_OUTBOUND_IMAGE_BYTES
+	)
+	safe_filename = (filename or "").strip() or upload_name
+
+	return send_facebook_image(
+		conversation_name=conversation,
+		client_nonce=client_nonce,
+		image_bytes=image_bytes,
+		filename=safe_filename,
+		content_type=upload_mime,
+	)
+
+
 def _ensure_can_trigger_connector_sync() -> None:
 	"""Agents and admins may trigger connector sync; others are rejected."""
 	ensure_omnichannel_agent()

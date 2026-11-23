@@ -17,8 +17,13 @@ from meta_omnichannel.meta_connectors.errors import (
 CONVERSATIONS_PATH = "/api/facebook/conversations"
 MESSAGES_PATH = "/api/facebook/messages"
 SEND_PATH = "/api/facebook/messages/send"
-# Meta Messenger attachment upload limit; refuse larger Connector payloads.
+SEND_IMAGE_PATH = "/api/facebook/messages/send-image"
+# Meta Messenger attachment upload limit; refuse larger Connector payloads (inbound GET).
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+# Confirmed outbound image send contract (Connector → Meta Attachment Upload API).
+MAX_OUTBOUND_IMAGE_BYTES = 8 * 1024 * 1024
+_OUTBOUND_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
+_OUTBOUND_IMAGE_TYPE_ALIASES = {"image/jpg": "image/jpeg"}
 
 
 class AttachmentPayload(NamedTuple):
@@ -73,6 +78,36 @@ def _is_allowed_attachment_content_type(content_type: str) -> bool:
 	if content_type in ("application/pdf", "application/octet-stream"):
 		return True
 	return content_type.startswith(("image/", "video/", "audio/"))
+
+
+def _normalize_outbound_image_content_type(content_type: str) -> str:
+	ct = (content_type or "").split(";", 1)[0].strip().lower()
+	return _OUTBOUND_IMAGE_TYPE_ALIASES.get(ct, ct)
+
+
+def _validate_outbound_image(
+	*,
+	image_bytes: bytes,
+	filename: str,
+	content_type: str,
+) -> tuple[bytes, str, str]:
+	"""Return ``(bytes, filename, content_type)`` or raise before any Connector call."""
+	if not isinstance(image_bytes, (bytes, bytearray)):
+		raise ConnectorError("send_image: image_bytes must be bytes")
+	payload = bytes(image_bytes)
+	if not payload:
+		raise ConnectorError("send_image: image_bytes must not be empty")
+	if len(payload) > MAX_OUTBOUND_IMAGE_BYTES:
+		raise ConnectorError("send_image: image exceeds 8 MiB limit")
+
+	ct = _normalize_outbound_image_content_type(content_type)
+	if ct not in _OUTBOUND_IMAGE_TYPES:
+		raise ConnectorError("send_image: content_type must be image/jpeg, image/png, or image/gif")
+
+	name = (filename or "").strip() or f"image.{ct.split('/', 1)[1]}"
+	# Path separators must not leak into the multipart filename.
+	name = name.replace("\\", "_").replace("/", "_")
+	return payload, name, ct
 
 
 class FacebookConnectorAdapter:
@@ -201,3 +236,49 @@ class FacebookConnectorAdapter:
 		if data and not isinstance(data, dict):
 			raise ConnectorError("send_text: response must be a JSON object")
 		return data or {"ok": True}
+
+	def send_image(
+		self,
+		*,
+		page_id: str,
+		recipient_id: str,
+		idempotency_key: str,
+		image_bytes: bytes,
+		filename: str,
+		content_type: str,
+	) -> dict[str, Any]:
+		"""POST multipart image bytes to the Connector (never a File URL).
+
+		Does not retry. Caller maps timeouts / HTTP 5xx to Unknown delivery.
+		"""
+		page_id = (page_id or "").strip()
+		recipient_id = (recipient_id or "").strip()
+		idempotency_key = (idempotency_key or "").strip()
+		if not page_id or not recipient_id or not idempotency_key:
+			raise ConnectorError(
+				"send_image: page_id, recipient_id, and idempotency_key are required"
+			)
+
+		payload, safe_name, mime = _validate_outbound_image(
+			image_bytes=image_bytes,
+			filename=filename,
+			content_type=content_type,
+		)
+
+		response = self.client.request(
+			"POST",
+			SEND_IMAGE_PATH,
+			data={
+				"page_id": page_id,
+				"recipient_id": recipient_id,
+				"idempotency_key": idempotency_key,
+			},
+			files={
+				"image": (safe_name, payload, mime),
+			},
+		)
+		_raise_for_status(response.status_code, context="send_image")
+		data = response.json() if response.content else {}
+		if data and not isinstance(data, dict):
+			raise ConnectorError("send_image: response must be a JSON object")
+		return data or {"status": "sent"}
