@@ -21,7 +21,10 @@
       send_image: "Send image",
       attach_image: "Attach image",
       remove_image: "Remove",
-      image_only_hint: "Image is sent without the text draft",
+      image_only_hint: "Only the image will be sent",
+      image_and_text_hint: "Image and text are sent as two separate Messenger messages",
+      image_sent_text_pending:
+        "Image was sent. The text was not sent — review the draft and send when ready.",
       image_type_rejected: "Use a JPEG, PNG, or GIF image",
       image_too_large: "Image must be 8 MiB or smaller",
       image_uncertain:
@@ -60,7 +63,10 @@
       send_image: "إرسال صورة",
       attach_image: "إرفاق صورة",
       remove_image: "إزالة",
-      image_only_hint: "تُرسل الصورة دون مسودة النص",
+      image_only_hint: "ستُرسل الصورة فقط",
+      image_and_text_hint: "تُرسل الصورة والنص كرسالتين منفصلتين في ماسنجر",
+      image_sent_text_pending:
+        "أُرسلت الصورة. لم يُرسل النص — راجع المسودة وأرسل عند الجاهزية.",
       image_type_rejected: "استخدم صورة JPEG أو PNG أو GIF",
       image_too_large: "يجب ألا تتجاوز الصورة 8 ميبيبايت",
       image_uncertain:
@@ -429,6 +435,35 @@
 
   /** Per-conversation pending outbound image (File + stable nonce + object URL). */
   const imageDrafts = Object.create(null);
+  /**
+   * Text captured for a conversation when image Sent but follow-up text was deferred
+   * (e.g. user switched threads). Restored on reopen; never auto-sent later.
+   */
+  const deferredTextByConversation = Object.create(null);
+
+  function stashDeferredText(conversationName, text, nonce) {
+    const key = conversationName || "";
+    const trimmed = (text || "").trim();
+    if (!key || !trimmed) return;
+    deferredTextByConversation[key] = { text: trimmed, nonce: nonce || null };
+  }
+
+  function clearDeferredText(conversationName) {
+    delete deferredTextByConversation[conversationName || ""];
+  }
+
+  function restoreDeferredTextIfAny(conversationName) {
+    const pending = deferredTextByConversation[conversationName || ""];
+    if (!pending) return;
+    state.draft = pending.text;
+    if (pending.nonce) {
+      sendAttempt = {
+        conversation: conversationName,
+        draftText: pending.text,
+        nonce: pending.nonce,
+      };
+    }
+  }
 
   function imageFileKey(file) {
     if (!file) return "";
@@ -848,6 +883,7 @@
     pendingScrollToLatest = false;
     clearSendAttempt();
     clearAllImageDrafts();
+    Object.keys(deferredTextByConversation).forEach((key) => clearDeferredText(key));
     sendGeneration += 1;
     state.error = t("empty_chat");
     messagesRefreshGen += 1;
@@ -915,6 +951,7 @@
     const asOf =
       row.last_inbound_at || row.last_message_at || new Date().toISOString();
     state.selected = row;
+    restoreDeferredTextIfAny(row && row.name);
     state.loadingChat = true;
     state.error = "";
     pendingScrollToLatest = true;
@@ -993,11 +1030,47 @@
     }
   }
 
+  function applyTextSendResult(result, opts) {
+    const conversationName = opts.conversationName;
+    const text = opts.text;
+    const myGen = opts.myGen;
+    const textNonce = opts.textNonce;
+    // Never mutate another conversation's draft from a stale response.
+    if (myGen !== sendGeneration) return "stale";
+    if (!state.selected || state.selected.name !== conversationName) {
+      if (result && result.ok) {
+        clearDeferredText(conversationName);
+        if (sendAttempt.conversation === conversationName) clearSendAttempt();
+        if ((state.draft || "").trim() === text) {
+          state.draft = "";
+        }
+      } else {
+        stashDeferredText(conversationName, text, textNonce || sendAttempt.nonce);
+      }
+      return "switched";
+    }
+    if ((state.draft || "").trim() !== text) return "edited";
+
+    if (result && result.ok) {
+      state.draft = "";
+      clearSendAttempt();
+      clearDeferredText(conversationName);
+      state.error = "";
+      return "ok";
+    }
+    if (result && result.uncertain) {
+      state.error = result.error || "Delivery has not been confirmed";
+    } else {
+      state.error = (result && result.error) || "Send failed";
+    }
+    return "kept";
+  }
+
   async function sendMessage() {
     // Synchronous in-flight guard — second click cannot start another request.
     if (state.sending) return;
     if (!state.selected || state.selected.provider !== "Facebook") return;
-    // Image selection uses image-only send — never silently attach draft text.
+    // Image selection uses image/combined send — never silently attach draft text here.
     const pendingImage = currentImageDraft();
     if (pendingImage && pendingImage.file) return;
     const text = (state.draft || "").trim();
@@ -1015,27 +1088,18 @@
         text: text,
         client_nonce: clientNonce,
       });
-      // Stale response: user switched thread or edited the draft mid-flight.
-      if (myGen !== sendGeneration) return;
-      if (!state.selected || state.selected.name !== conversationName) return;
-      if ((state.draft || "").trim() !== text) return;
-
-      if (result && result.ok) {
-        state.draft = "";
-        clearSendAttempt();
-        state.error = "";
+      const outcome = applyTextSendResult(result, {
+        conversationName,
+        text,
+        myGen,
+        textNonce: clientNonce,
+      });
+      if (outcome === "ok") {
         await openConversation(state.selected);
         await loadList();
         return;
       }
-
-      // Definitive failure or uncertain delivery — keep draft + nonce; never auto-resend.
-      if (result && result.uncertain) {
-        state.error = result.error || "Delivery has not been confirmed";
-      } else {
-        state.error = (result && result.error) || "Send failed";
-      }
-      render();
+      if (outcome === "kept") render();
     } catch (e) {
       if (myGen !== sendGeneration) return;
       if (!state.selected || state.selected.name !== conversationName) return;
@@ -1058,6 +1122,11 @@
       state.error = t("image_uncertain");
       render();
       return;
+    }
+    // Combined path when composer has both image and text.
+    const companionText = (state.draft || "").trim();
+    if (companionText) {
+      return sendCombinedImageAndText();
     }
 
     const clientNonce = draft.nonce || nonceForImage(conversationName, draft.file);
@@ -1085,7 +1154,7 @@
 
       if (result && result.ok) {
         clearImageDraft(conversationName);
-        // Keep text draft intact — captions are unsupported.
+        // Image-only: keep any unrelated text draft intact.
         state.error = "";
         await openConversation(state.selected);
         await loadList();
@@ -1112,10 +1181,140 @@
     }
   }
 
+  /**
+   * Image then text as two Messenger messages. Holds state.sending across both.
+   * If the user leaves the conversation after image Sent, text is deferred (not auto-sent).
+   */
+  async function sendCombinedImageAndText() {
+    if (state.sending) return;
+    if (!state.selected || state.selected.provider !== "Facebook") return;
+    const conversationName = state.selected.name;
+    const draft = imageDrafts[conversationName];
+    if (!draft || !draft.file) return;
+    if (draft.blockResend) {
+      state.error = t("image_uncertain");
+      render();
+      return;
+    }
+    const text = (state.draft || "").trim();
+    if (!text) {
+      return sendImageMessage();
+    }
+
+    const imageNonce = draft.nonce || nonceForImage(conversationName, draft.file);
+    draft.nonce = imageNonce;
+    const fileKey = draft.fileKey;
+    const imageFile = draft.file;
+    const textNonce = nonceForDraft(conversationName, text);
+    const myGen = ++sendGeneration;
+    state.sending = true;
+    state.error = "";
+    render();
+
+    try {
+      const imageResult = await callMultipart(
+        "meta_omnichannel.api.inbox.send_image_message",
+        {
+          conversation: conversationName,
+          client_nonce: imageNonce,
+        },
+        "image",
+        imageFile
+      );
+
+      const imageRow = imageDrafts[conversationName];
+      const imageStillOurs =
+        imageRow && imageRow.fileKey === fileKey && imageRow.nonce === imageNonce;
+
+      if (!(imageResult && imageResult.ok)) {
+        if (imageStillOurs) {
+          if (imageResult && imageResult.uncertain) {
+            imageRow.blockResend = true;
+          }
+        }
+        // Keep text draft + text nonce; never start text after Failed/Unknown.
+        if (myGen === sendGeneration && state.selected && state.selected.name === conversationName) {
+          if (imageResult && imageResult.uncertain) {
+            state.error = t("image_uncertain");
+          } else {
+            state.error = (imageResult && imageResult.error) || "Send failed";
+          }
+          render();
+        }
+        return;
+      }
+
+      // Confirmed image Sent — clear image for this conversation only.
+      clearImageDraft(conversationName);
+
+      // Defer text if the user switched away or edited before we start text.
+      const stillOnConversation =
+        !!state.selected && state.selected.name === conversationName;
+      const draftUnchanged = (state.draft || "").trim() === text;
+      if (!stillOnConversation || myGen !== sendGeneration || !draftUnchanged) {
+        stashDeferredText(conversationName, text, textNonce);
+        if (stillOnConversation && myGen === sendGeneration) {
+          state.error = t("image_sent_text_pending");
+          render();
+        }
+        return;
+      }
+
+      // Second request uses captured conversation/text/nonce — not live selection for targeting.
+      const textResult = await call("meta_omnichannel.api.inbox.send_message", {
+        conversation: conversationName,
+        text: text,
+        client_nonce: textNonce,
+      });
+
+      const outcome = applyTextSendResult(textResult, {
+        conversationName,
+        text,
+        myGen,
+        textNonce,
+      });
+      if (outcome === "ok") {
+        await openConversation(state.selected);
+        await loadList();
+        return;
+      }
+      if (outcome === "kept" || outcome === "edited") {
+        if (outcome === "edited" && !state.error) {
+          state.error = t("image_sent_text_pending");
+        }
+        render();
+      }
+      // outcome === "switched": image already Sent; text handled without touching B.
+    } catch (e) {
+      // Exception may be from image or text phase.
+      const imageRow = imageDrafts[conversationName];
+      if (imageRow && imageRow.fileKey === fileKey) {
+        // Image phase likely failed before clear.
+        if (myGen === sendGeneration && state.selected && state.selected.name === conversationName) {
+          state.error = e.message || String(e);
+          render();
+        }
+        return;
+      }
+      // Image was cleared — treat as text-phase failure; keep text + nonce.
+      stashDeferredText(conversationName, text, textNonce);
+      if (myGen !== sendGeneration) return;
+      if (!state.selected || state.selected.name !== conversationName) return;
+      if ((state.draft || "").trim() !== text) return;
+      state.error = e.message || String(e);
+      render();
+    } finally {
+      state.sending = false;
+      render();
+    }
+  }
+
   function sendComposer() {
     if (state.sending) return;
     const img = currentImageDraft();
     if (img && img.file) {
+      const companionText = (state.draft || "").trim();
+      if (companionText) return sendCombinedImageAndText();
       return sendImageMessage();
     }
     return sendMessage();
@@ -1305,7 +1504,12 @@
               className: "oc-composer-filename",
               text: imageDraft.filename || "image",
             }),
-            el("div", { className: "oc-composer-hint", text: t("image_only_hint") }),
+            el("div", {
+              className: "oc-composer-hint",
+              text: (state.draft || "").trim()
+                ? t("image_and_text_hint")
+                : t("image_only_hint"),
+            }),
           ])
         );
         preview.appendChild(
@@ -1369,7 +1573,12 @@
         el("button", {
           className: "oc-btn",
           type: "button",
-          text: hasImage ? t("send_image") : t("send"),
+          text:
+            hasImage && (state.draft || "").trim()
+              ? t("send")
+              : hasImage
+                ? t("send_image")
+                : t("send"),
           disabled: !canSend,
           onclick: sendComposer,
         })
@@ -1641,9 +1850,16 @@
     openConversation: openConversation,
     sendMessage: sendMessage,
     sendImageMessage: sendImageMessage,
+    sendCombinedImageAndText: sendCombinedImageAndText,
     sendComposer: sendComposer,
     selectComposerImage: selectComposerImage,
     removeComposerImage: removeComposerImage,
+    getDeferredText: function (conversationName) {
+      const pending = deferredTextByConversation[conversationName || ""];
+      return pending
+        ? { text: pending.text, nonce: pending.nonce || null }
+        : null;
+    },
     drainPendingSoftMessageRefresh: drainPendingSoftMessageRefresh,
     getPendingSoftMessageRefresh: function () {
       return pendingSoftMessageRefresh;

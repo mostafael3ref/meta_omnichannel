@@ -759,11 +759,14 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("function onDraftInput", js)
 		self.assertIn("clearSendAttempt()", js)
 		self.assertIn("client_nonce: clientNonce", js)
-		# Draft cleared only on confirmed success — not on every HTTP 200.
+		# Draft cleared only on confirmed success — shared helper used by text + combined.
+		self.assertIn("function applyTextSendResult", js)
+		helper = js[js.index("function applyTextSendResult") : js.index("async function sendMessage")]
+		self.assertIn("result && result.ok", helper)
+		self.assertIn("state.draft = \"\"", helper)
+		self.assertIn("result.uncertain", helper)
 		send_fn = js[js.index("async function sendMessage") : js.index("async function sendImageMessage")]
-		self.assertIn("result && result.ok", send_fn)
-		self.assertIn("state.draft = \"\"", send_fn)
-		self.assertIn("result.uncertain", send_fn)
+		self.assertIn("applyTextSendResult", send_fn)
 		self.assertIn("myGen !== sendGeneration", send_fn)
 		# Composer disables while sending.
 		self.assertIn("!state.sending", js)
@@ -785,13 +788,22 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("MAX_COMPOSER_IMAGE_BYTES", js)
 		self.assertIn("blockResend", js)
 		self.assertIn("image_only_hint", js)
+		self.assertIn("image_and_text_hint", js)
+		self.assertIn("image_sent_text_pending", js)
+		self.assertIn("function sendCombinedImageAndText", js)
 		self.assertIn("oc-composer-attach", js)
 		self.assertIn("accept: \"image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif\"", js)
-		# Captions unsupported — image send must not append draft text.
-		img_fn = js[js.index("async function sendImageMessage") : js.index("function sendComposer")]
-		self.assertNotIn("text:", img_fn)
-		self.assertNotIn("state.draft", img_fn)
-		self.assertIn("Keep text draft intact", img_fn)
+		# Captions unsupported — multipart image request must not append draft text.
+		combined = js[
+			js.index("async function sendCombinedImageAndText") : js.index("function sendComposer")
+		]
+		self.assertIn("callMultipart", combined)
+		self.assertNotIn("text: text", combined.split("send_image_message")[0])
+		self.assertIn('"image"', combined)
+		self.assertIn("client_nonce: imageNonce", combined)
+		# Text follows only after confirmed image ok; never as image caption field.
+		self.assertIn("send_message", combined)
+		self.assertIn("stashDeferredText", combined)
 		css = (ROOT / "meta_omnichannel" / "public" / "frontend" / "omnichannel.css").read_text(
 			encoding="utf-8"
 		)
@@ -1961,7 +1973,8 @@ async function settleOpenListCalls(items) {
       unread_count: 0,
     };
     await openReadyConversation(row, []);
-    api.setDraft("caption must not go");
+    // Image-only: empty draft so combined path is not taken.
+    api.setDraft("");
     assert.ok(api.selectComposerImage(makeImageFile({ name: "shot.jpg", type: "image/jpeg", size: 200 })));
     const nonce1 = api.getImageAttemptNonce();
     const p1 = api.sendComposer();
@@ -1987,7 +2000,7 @@ async function settleOpenListCalls(items) {
     await p2;
     await settle;
     assert.strictEqual(api.getState().hasImageDraft, false, "cleared on success");
-    assert.strictEqual(api.getState().draft, "caption must not go", "text draft preserved");
+    assert.strictEqual(api.getState().draft, "", "image-only leaves empty draft");
     assert.strictEqual(api.getImageAttemptNonce(), null);
     console.log("OK image_send_multipart_csrf_and_dedupe");
     return;
@@ -2130,6 +2143,268 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "combined_image_then_text_success") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("hello with photo");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "c.png", type: "image/png", size: 20 })));
+    const imgNonce = api.getImageAttemptNonce();
+    assert.ok(imgNonce);
+    const p1 = api.sendComposer();
+    const p2 = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "combined image");
+    assert.strictEqual(gate.sendImage.length, 1);
+    assert.strictEqual(gate.send.length, 0, "no text before image Sent");
+    assert.strictEqual(gate.sendImage[0].text, null, "no caption on multipart");
+    assert.strictEqual(gate.sendImage[0].client_nonce, imgNonce);
+    assert.strictEqual(api.getState().sending, true);
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    assert.notStrictEqual(imgNonce, textNonce);
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "text after image");
+    assert.strictEqual(api.getState().sending, true, "sending held across text");
+    assert.strictEqual(gate.send[0].text, "hello with photo");
+    assert.strictEqual(gate.send[0].client_nonce, textNonce);
+    assert.strictEqual(gate.send[0].conversation, "CONV-A");
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-TXT",
+      deduplicated: false,
+    });
+    await p1;
+    await p2;
+    await settle;
+    assert.strictEqual(gate.sendImage.length, 1);
+    assert.strictEqual(gate.send.length, 1);
+    assert.strictEqual(api.getState().hasImageDraft, false);
+    assert.strictEqual(api.getState().draft, "");
+    assert.strictEqual(api.getSendAttemptNonce(), null);
+    console.log("OK combined_image_then_text_success");
+    return;
+  }
+
+  if (scenario === "combined_image_failed_skips_text") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("keep me");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "f.png", type: "image/png", size: 12 })));
+    const imgNonce = api.getImageAttemptNonce();
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "fail image");
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle fail");
+    assert.strictEqual(gate.send.length, 0, "text not sent after image Failed");
+    assert.strictEqual(api.getState().hasImageDraft, true);
+    assert.strictEqual(api.getImageAttemptNonce(), imgNonce);
+    assert.strictEqual(api.getState().draft, "keep me");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    console.log("OK combined_image_failed_skips_text");
+    return;
+  }
+
+  if (scenario === "combined_image_unknown_skips_text") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("maybe later");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "u.png", type: "image/png", size: 12 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "unknown image");
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle unknown");
+    assert.strictEqual(gate.send.length, 0);
+    assert.ok(api.getImageDraft().blockResend);
+    assert.strictEqual(api.getState().draft, "maybe later");
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("unconfirmed") >= 0);
+    console.log("OK combined_image_unknown_skips_text");
+    return;
+  }
+
+  if (scenario === "combined_image_sent_text_failed_keeps_text") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("after image");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "ok.png", type: "image/png", size: 12 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "img");
+    const textNonce = api.getSendAttemptNonce();
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "txt");
+    assert.strictEqual(gate.send[0].client_nonce, textNonce);
+    gate.send[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "text failed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(api.getState().hasImageDraft, false, "image cleared");
+    assert.strictEqual(api.getState().draft, "after image");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    assert.ok(api.getState().error);
+    console.log("OK combined_image_sent_text_failed_keeps_text");
+    return;
+  }
+
+  if (scenario === "combined_image_sent_text_unknown_keeps_text") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("uncertain text");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "ok.png", type: "image/png", size: 12 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "img");
+    const textNonce = api.getSendAttemptNonce();
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "txt");
+    gate.send[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(api.getState().hasImageDraft, false);
+    assert.strictEqual(api.getState().draft, "uncertain text");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    assert.strictEqual(gate.send.length, 1, "no auto-retry");
+    console.log("OK combined_image_sent_text_unknown_keeps_text");
+    return;
+  }
+
+  if (scenario === "combined_switch_during_image_defers_text") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(rowA, []);
+    api.setDraft("text for A");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "a.png", type: "image/png", size: 20 })));
+    const pSend = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "image A");
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    const msgBefore = gate.messages.length;
+    const panelBefore = gate.panel.length;
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length > msgBefore, "open B messages");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBefore, "open B panel");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    api.setDraft("text for B");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG-A",
+      deduplicated: false,
+    });
+    await pSend;
+    await waitUntil(() => api.getState().sending === false, "send finished");
+    assert.strictEqual(gate.send.length, 0, "text deferred after switch");
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    assert.strictEqual(api.getState().draft, "text for B");
+    const deferred = api.getDeferredText("CONV-A");
+    assert.ok(deferred);
+    assert.strictEqual(deferred.text, "text for A");
+    assert.strictEqual(deferred.nonce, textNonce);
+    // Switching back restores deferred text; must not auto-send.
+    const msgBefore2 = gate.messages.length;
+    const panelBefore2 = gate.panel.length;
+    const openA = api.openConversation(rowA);
+    await waitUntil(() => gate.messages.length > msgBefore2, "reopen A");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBefore2, "reopen A panel");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openA;
+    assert.strictEqual(api.getState().draft, "text for A");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    assert.strictEqual(gate.send.length, 0, "no auto text on reopen");
+    console.log("OK combined_switch_during_image_defers_text");
+    return;
+  }
+
   throw new Error("unknown scenario " + scenario);
 })().catch((err) => {
   console.error(err && err.stack ? err.stack : err);
@@ -2256,6 +2531,30 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_image_instagram_no_attach(self):
 		out = self._run_scenario("image_instagram_no_attach")
 		self.assertIn("OK image_instagram_no_attach", out)
+
+	def test_combined_image_then_text_success(self):
+		out = self._run_scenario("combined_image_then_text_success")
+		self.assertIn("OK combined_image_then_text_success", out)
+
+	def test_combined_image_failed_skips_text(self):
+		out = self._run_scenario("combined_image_failed_skips_text")
+		self.assertIn("OK combined_image_failed_skips_text", out)
+
+	def test_combined_image_unknown_skips_text(self):
+		out = self._run_scenario("combined_image_unknown_skips_text")
+		self.assertIn("OK combined_image_unknown_skips_text", out)
+
+	def test_combined_image_sent_text_failed_keeps_text(self):
+		out = self._run_scenario("combined_image_sent_text_failed_keeps_text")
+		self.assertIn("OK combined_image_sent_text_failed_keeps_text", out)
+
+	def test_combined_image_sent_text_unknown_keeps_text(self):
+		out = self._run_scenario("combined_image_sent_text_unknown_keeps_text")
+		self.assertIn("OK combined_image_sent_text_unknown_keeps_text", out)
+
+	def test_combined_switch_during_image_defers_text(self):
+		out = self._run_scenario("combined_switch_during_image_defers_text")
+		self.assertIn("OK combined_switch_during_image_defers_text", out)
 
 
 if __name__ == "__main__":
