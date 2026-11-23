@@ -661,6 +661,16 @@
     }
   }
 
+  /** Clear sending and unlock composer without rebuilding the message list. */
+  function finishSending() {
+    state.sending = false;
+    if (state.selected && !state.loadingChat && root.querySelector(".oc-chat .oc-messages")) {
+      syncComposerControls();
+      return;
+    }
+    render();
+  }
+
   function onDraftInput(value) {
     state.draft = value;
     const trimmed = (value || "").trim();
@@ -755,17 +765,21 @@
     return chrome;
   }
 
-  function restoreUiChrome(chrome) {
+  function restoreUiChrome(chrome, options) {
     if (!chrome) return;
+    const opts = options || {};
     const msgs = root.querySelector(".oc-messages");
     if (msgs) {
       // Opening a conversation always lands on the latest message.
-      // Soft refreshes keep prior position unless the user was near the bottom.
+      // Soft message refreshes keep prior position unless the user was near the bottom.
+      // preserveChat reuses the same .oc-messages node — restore exact scrollTop only
+      // (near-bottom follow belongs to content refresh, not list-only soft redraw).
       if (pendingScrollToLatest && !state.loadingChat) {
         msgs.scrollTop = msgs.scrollHeight;
         pendingScrollToLatest = false;
       } else if (!pendingScrollToLatest) {
-        if (chrome.nearBottom) msgs.scrollTop = msgs.scrollHeight;
+        if (opts.preserveScrollExact) msgs.scrollTop = chrome.scrollTop;
+        else if (chrome.nearBottom) msgs.scrollTop = msgs.scrollHeight;
         else msgs.scrollTop = chrome.scrollTop;
       }
     }
@@ -993,6 +1007,21 @@
     }
   }
 
+  /**
+   * After a confirmed outbound send: soft-refresh the active thread without
+   * full-chat Loading (keeps existing bubbles visible), then soft-refresh the
+   * conversation list preview (preserveChat — no chat rebuild / error wipe).
+   * Never clears state.messages first. Scroll follows soft-refresh rules
+   * (near-bottom → tip; reading older → preserve).
+   */
+  async function refreshAfterSend(conversationName) {
+    if (!conversationName) return;
+    if (state.selected && state.selected.name === conversationName) {
+      await softRefreshMessages(conversationName);
+    }
+    await softLoadList();
+  }
+
   async function openConversation(row) {
     const seq = ++openConversationSeq;
     // Open-time read watermark: prefer inbound/list tip; wall-clock fallback so
@@ -1144,8 +1173,7 @@
         textNonce: clientNonce,
       });
       if (outcome === "ok") {
-        await openConversation(state.selected);
-        await loadList();
+        await refreshAfterSend(conversationName);
         return;
       }
       if (outcome === "kept") render();
@@ -1156,8 +1184,7 @@
       state.error = e.message || String(e);
       render();
     } finally {
-      state.sending = false;
-      render();
+      finishSending();
     }
   }
 
@@ -1205,8 +1232,7 @@
         clearImageDraft(conversationName);
         // Image-only: keep any unrelated text draft intact.
         state.error = "";
-        await openConversation(state.selected);
-        await loadList();
+        await refreshAfterSend(conversationName);
         return;
       }
 
@@ -1225,8 +1251,7 @@
       state.error = e.message || String(e);
       render();
     } finally {
-      state.sending = false;
-      render();
+      finishSending();
     }
   }
 
@@ -1323,8 +1348,7 @@
         textNonce,
       });
       if (outcome === "ok") {
-        await openConversation(state.selected);
-        await loadList();
+        await refreshAfterSend(conversationName);
         return;
       }
       if (outcome === "kept" || outcome === "edited") {
@@ -1353,8 +1377,7 @@
       state.error = e.message || String(e);
       render();
     } finally {
-      state.sending = false;
-      render();
+      finishSending();
     }
   }
 
@@ -1759,7 +1782,7 @@
     shell.appendChild(chat);
     shell.appendChild(customer);
     root.appendChild(shell);
-    restoreUiChrome(chrome);
+    restoreUiChrome(chrome, { preserveScrollExact: !!reusedChat });
   }
 
   async function flushRealtimeRefresh() {
@@ -1893,6 +1916,7 @@
     subscribeRealtimeOnce: subscribeRealtimeOnce,
     softRefreshMessages: softRefreshMessages,
     softLoadList: softLoadList,
+    refreshAfterSend: refreshAfterSend,
     openConversation: openConversation,
     sendMessage: sendMessage,
     sendImageMessage: sendImageMessage,

@@ -694,6 +694,8 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("isPermissionError", soft)
 		self.assertIn("clearInaccessibleConversation", soft)
 		self.assertIn("pendingSoftMessageRefresh", soft)
+		self.assertIn("async function refreshAfterSend", soft)
+		self.assertIn("softRefreshMessages(conversationName)", soft)
 
 		flush_start = js.index("async function flushRealtimeRefresh")
 		flush_end = js.index("function scheduleRealtimeRefresh")
@@ -703,12 +705,48 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertNotIn("get_customer_panel", flush)
 		self.assertNotIn("openConversation(", flush)
 
+	def test_send_success_uses_soft_refresh_not_open_conversation(self):
+		"""Post-send must not flash full-chat Loading via openConversation."""
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		send_msg = js[
+			js.index("async function sendMessage()") : js.index("async function sendImageMessage()")
+		]
+		send_img = js[
+			js.index("async function sendImageMessage()") : js.index(
+				"async function sendCombinedImageAndText()"
+			)
+		]
+		combined = js[
+			js.index("async function sendCombinedImageAndText()") : js.index(
+				"function sendComposer()"
+			)
+		]
+		for body, label in (
+			(send_msg, "sendMessage"),
+			(send_img, "sendImageMessage"),
+			(combined, "sendCombinedImageAndText"),
+		):
+			self.assertIn("refreshAfterSend(", body, label)
+			self.assertNotIn("openConversation(", body, label)
+			self.assertNotIn("loadingChat = true", body, label)
+		refresh = js[
+			js.index("async function refreshAfterSend") : js.index("async function openConversation")
+		]
+		self.assertIn("softRefreshMessages(", refresh)
+		self.assertIn("softLoadList()", refresh)
+		self.assertNotIn("loadingChat = true", refresh)
+		self.assertNotIn("openConversation(", refresh)
+		self.assertNotIn("get_customer_panel", refresh)
+		# Hard loadList clears error + rebuilds chat; post-send must stay soft.
+		self.assertNotIn("loadList()", refresh)
+
 	def test_render_preserves_composer_search_and_note_chrome(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
 		self.assertIn("function captureUiChrome", js)
 		self.assertIn("function restoreUiChrome", js)
 		self.assertIn("const chrome = captureUiChrome()", js)
-		self.assertIn("restoreUiChrome(chrome)", js)
+		self.assertIn("restoreUiChrome(chrome,", js)
+		self.assertIn("preserveScrollExact", js)
 		self.assertIn("captureFocusedField", js)
 		self.assertIn(".oc-composer textarea", js)
 		self.assertIn(".oc-list-toolbar input[type='search']", js)
@@ -1276,7 +1314,7 @@ async function openReadyConversation(row, messages) {
 }
 
 async function settlePostSendRefresh() {
-  // Success path awaits openConversation + loadList — resolve gates as they appear.
+  // Success path awaits softRefreshMessages (list_messages) + loadList — no panel.
   for (let i = 0; i < 200; i++) {
     for (const entry of gate.messages) {
       if (!entry.d.isSettled()) {
@@ -1301,6 +1339,18 @@ async function settlePostSendRefresh() {
     await sleep(10);
   }
   throw new Error("timeout settling post-send refresh");
+}
+
+function loadingEmptyVisible() {
+  const empty = root.querySelector(".oc-empty");
+  return !!(empty && /loading/i.test(empty.textContent || ""));
+}
+
+function bubbleTexts() {
+  return Array.from(root.querySelectorAll(".oc-bubble")).map((n) => {
+    const body = n.querySelector(".oc-bubble-text");
+    return body ? body.textContent : n.textContent;
+  });
 }
 
 const bootItems = [
@@ -2583,6 +2633,485 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "send_success_keeps_messages_visible") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const prior = [
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "prior",
+        sent_at: "1",
+      },
+    ];
+    await openReadyConversation(row, prior);
+    assert.strictEqual(api.getState().messageCount, 1);
+    assert.ok(bubbleTexts().some((t) => t.indexOf("prior") !== -1));
+    const panelAfterOpen = gate.panel.length;
+    api.setDraft("hello");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send");
+    const msgBeforeRefresh = gate.messages.length;
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBeforeRefresh, "soft refresh");
+    assert.strictEqual(api.getState().loadingChat, false, "no loadingChat during refresh");
+    assert.strictEqual(loadingEmptyVisible(), false, "no full-chat Loading");
+    assert.ok(bubbleTexts().some((t) => t.indexOf("prior") !== -1), "old bubble stays");
+    assert.strictEqual(gate.panel.length, panelAfterOpen, "no panel reload after send");
+    const softEntry = gate.messages[gate.messages.length - 1];
+    softEntry.d.resolve([
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "prior",
+        sent_at: "1",
+      },
+      {
+        name: "m-out",
+        direction: "Outbound",
+        message_type: "Text",
+        text_content: "hello",
+        sent_at: "2",
+      },
+    ]);
+    const settle = settlePostSendRefresh();
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().loadingChat, false);
+    assert.strictEqual(loadingEmptyVisible(), false);
+    assert.strictEqual(api.getState().messageCount, 2);
+    const texts = bubbleTexts();
+    assert.strictEqual(texts.filter((t) => t.indexOf("prior") !== -1).length, 1, "no dup prior");
+    assert.strictEqual(texts.filter((t) => t.indexOf("hello") !== -1).length, 1, "no dup hello");
+    console.log("OK send_success_keeps_messages_visible");
+    return;
+  }
+
+  if (scenario === "image_send_success_keeps_messages_visible") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, [
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "prior img",
+        sent_at: "1",
+      },
+    ]);
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "p.png", type: "image/png", size: 9 })));
+    const p = api.sendImageMessage();
+    await waitUntil(() => gate.sendImage.length >= 1, "img send");
+    const msgBefore = gate.messages.length;
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBefore, "img soft refresh");
+    assert.strictEqual(api.getState().loadingChat, false);
+    assert.strictEqual(loadingEmptyVisible(), false);
+    assert.ok(bubbleTexts().some((t) => t.indexOf("prior img") !== -1));
+    gate.messages[gate.messages.length - 1].d.resolve([
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "prior img",
+        sent_at: "1",
+      },
+      {
+        name: "m-img",
+        direction: "Outbound",
+        message_type: "Image",
+        text_content: "",
+        sent_at: "2",
+      },
+    ]);
+    const settle = settlePostSendRefresh();
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().messageCount, 2);
+    console.log("OK image_send_success_keeps_messages_visible");
+    return;
+  }
+
+  if (scenario === "combined_send_no_loading_between_phases") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, [
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "prior combo",
+        sent_at: "1",
+      },
+    ]);
+    api.setDraft("caption");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "c.png", type: "image/png", size: 11 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "combo img");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "combo text");
+    assert.strictEqual(api.getState().loadingChat, false, "no Loading between image and text");
+    assert.strictEqual(loadingEmptyVisible(), false);
+    assert.ok(bubbleTexts().some((t) => t.indexOf("prior combo") !== -1));
+    const msgBefore = gate.messages.length;
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-TXT",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBefore, "combo soft");
+    assert.strictEqual(api.getState().loadingChat, false);
+    assert.strictEqual(loadingEmptyVisible(), false);
+    assert.ok(bubbleTexts().some((t) => t.indexOf("prior combo") !== -1));
+    gate.messages[gate.messages.length - 1].d.resolve([
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "prior combo",
+        sent_at: "1",
+      },
+      {
+        name: "m-img",
+        direction: "Outbound",
+        message_type: "Image",
+        text_content: "",
+        sent_at: "2",
+      },
+      {
+        name: "m-txt",
+        direction: "Outbound",
+        message_type: "Text",
+        text_content: "caption",
+        sent_at: "3",
+      },
+    ]);
+    const settle = settlePostSendRefresh();
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().messageCount, 3);
+    console.log("OK combined_send_no_loading_between_phases");
+    return;
+  }
+
+  if (scenario === "send_refresh_failure_keeps_messages") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, [
+      {
+        name: "m-old",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "keep me",
+        sent_at: "1",
+      },
+    ]);
+    api.setDraft("boom");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send fail-refresh");
+    const msgBefore = gate.messages.length;
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBefore, "soft fail pending");
+    assert.ok(bubbleTexts().some((t) => t.indexOf("keep me") !== -1));
+    gate.messages[gate.messages.length - 1].d.reject(new Error("list_messages down"));
+    const settle = settlePostSendRefresh();
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().loadingChat, false);
+    assert.strictEqual(loadingEmptyVisible(), false);
+    assert.strictEqual(api.getState().messageCount, 1, "messages preserved on refresh fail");
+    assert.ok(bubbleTexts().some((t) => t.indexOf("keep me") !== -1));
+    assert.ok(api.getState().error, "error surfaced");
+    console.log("OK send_refresh_failure_keeps_messages");
+    return;
+  }
+
+  if (scenario === "send_refresh_stale_switch_ignored") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(rowA, [
+      {
+        name: "a1",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "thread A",
+        sent_at: "1",
+      },
+    ]);
+    api.setDraft("from A");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send A");
+    const msgBefore = gate.messages.length;
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-A",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBefore, "soft A pending");
+    const staleSoft = gate.messages[gate.messages.length - 1];
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length > msgBefore + 1, "open B messages");
+    gate.messages[gate.messages.length - 1].d.resolve([
+      {
+        name: "b1",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "thread B",
+        sent_at: "1",
+      },
+    ]);
+    await waitUntil(() => gate.panel.length >= 2, "panel B");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    // Stale soft refresh for A must not overwrite B.
+    staleSoft.d.resolve([
+      {
+        name: "a-stale",
+        direction: "Outbound",
+        message_type: "Text",
+        text_content: "should not appear",
+        sent_at: "9",
+      },
+    ]);
+    const settle = settlePostSendRefresh();
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    assert.ok(bubbleTexts().some((t) => t.indexOf("thread B") !== -1));
+    assert.ok(!bubbleTexts().some((t) => t.indexOf("should not appear") !== -1));
+    console.log("OK send_refresh_stale_switch_ignored");
+    return;
+  }
+
+  if (scenario === "send_refresh_scroll_near_and_away") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, [
+      {
+        name: "m1",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "one",
+        sent_at: "1",
+      },
+      {
+        name: "m2",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "two",
+        sent_at: "2",
+      },
+    ]);
+    function paintScroll(top, height, client) {
+      const pane = root.querySelector(".oc-messages");
+      assert.ok(pane, "messages pane");
+      pane.scrollHeight = height;
+      pane.clientHeight = client;
+      pane.scrollTop = top;
+      return pane;
+    }
+
+    paintScroll(40, 800, 200);
+    api.setDraft("away");
+    const pAway = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send away");
+    // sendMessage render rebuilds the pane — restore reading position metrics.
+    paintScroll(40, 800, 200);
+    const msgBeforeAway = gate.messages.length;
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-AWAY",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBeforeAway, "soft away");
+    paintScroll(40, 800, 200);
+    gate.messages[gate.messages.length - 1].d.resolve([
+      {
+        name: "m1",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "one",
+        sent_at: "1",
+      },
+      {
+        name: "m2",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "two",
+        sent_at: "2",
+      },
+      {
+        name: "m3",
+        direction: "Outbound",
+        message_type: "Text",
+        text_content: "away",
+        sent_at: "3",
+      },
+    ]);
+    const settleAway = settlePostSendRefresh();
+    await pAway;
+    await settleAway;
+    let msgs = root.querySelector(".oc-messages");
+    assert.strictEqual(msgs.scrollTop, 40, "away from bottom preserves scroll after send refresh");
+
+    paintScroll(740, 800, 200);
+    api.setDraft("near");
+    const pNear = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 2, "send near");
+    paintScroll(740, 800, 200);
+    const msgBeforeNear = gate.messages.length;
+    gate.send[1].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-NEAR",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.messages.length > msgBeforeNear, "soft near");
+    paintScroll(740, 800, 200);
+    gate.messages[gate.messages.length - 1].d.resolve([
+      {
+        name: "m1",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "one",
+        sent_at: "1",
+      },
+      {
+        name: "m2",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "two",
+        sent_at: "2",
+      },
+      {
+        name: "m3",
+        direction: "Outbound",
+        message_type: "Text",
+        text_content: "away",
+        sent_at: "3",
+      },
+      {
+        name: "m4",
+        direction: "Outbound",
+        message_type: "Text",
+        text_content: "near",
+        sent_at: "4",
+      },
+    ]);
+    const settleNear = settlePostSendRefresh();
+    await pNear;
+    await settleNear;
+    msgs = root.querySelector(".oc-messages");
+    assert.strictEqual(
+      msgs.scrollTop,
+      msgs.scrollHeight,
+      "near-bottom send refresh follows newest"
+    );
+    console.log("OK send_refresh_scroll_near_and_away");
+    return;
+  }
+
+  if (scenario === "initial_open_still_shows_loading") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const openP = api.openConversation(row);
+    await waitUntil(() => api.getState().loadingChat === true, "loading on open");
+    assert.ok(loadingEmptyVisible(), "Loading visible on initial open");
+    await waitUntil(() => gate.messages.length >= 1, "open messages");
+    gate.messages[0].d.resolve([
+      {
+        name: "m1",
+        direction: "Inbound",
+        message_type: "Text",
+        text_content: "hi",
+        sent_at: "1",
+      },
+    ]);
+    await waitUntil(() => gate.panel.length >= 1, "panel");
+    gate.panel[0].d.resolve({ lead: null, notes: [] });
+    await openP;
+    assert.strictEqual(api.getState().loadingChat, false);
+    assert.strictEqual(loadingEmptyVisible(), false);
+    console.log("OK initial_open_still_shows_loading");
+    return;
+  }
+
   throw new Error("unknown scenario " + scenario);
 })().catch((err) => {
   console.error(err && err.stack ? err.stack : err);
@@ -2749,6 +3278,34 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_composer_unlocks_on_switch_during_send(self):
 		out = self._run_scenario("composer_unlocks_on_switch_during_send")
 		self.assertIn("OK composer_unlocks_on_switch_during_send", out)
+
+	def test_send_success_keeps_messages_visible(self):
+		out = self._run_scenario("send_success_keeps_messages_visible")
+		self.assertIn("OK send_success_keeps_messages_visible", out)
+
+	def test_image_send_success_keeps_messages_visible(self):
+		out = self._run_scenario("image_send_success_keeps_messages_visible")
+		self.assertIn("OK image_send_success_keeps_messages_visible", out)
+
+	def test_combined_send_no_loading_between_phases(self):
+		out = self._run_scenario("combined_send_no_loading_between_phases")
+		self.assertIn("OK combined_send_no_loading_between_phases", out)
+
+	def test_send_refresh_failure_keeps_messages(self):
+		out = self._run_scenario("send_refresh_failure_keeps_messages")
+		self.assertIn("OK send_refresh_failure_keeps_messages", out)
+
+	def test_send_refresh_stale_switch_ignored(self):
+		out = self._run_scenario("send_refresh_stale_switch_ignored")
+		self.assertIn("OK send_refresh_stale_switch_ignored", out)
+
+	def test_send_refresh_scroll_near_and_away(self):
+		out = self._run_scenario("send_refresh_scroll_near_and_away")
+		self.assertIn("OK send_refresh_scroll_near_and_away", out)
+
+	def test_initial_open_still_shows_loading(self):
+		out = self._run_scenario("initial_open_still_shows_loading")
+		self.assertIn("OK initial_open_still_shows_loading", out)
 
 
 if __name__ == "__main__":
