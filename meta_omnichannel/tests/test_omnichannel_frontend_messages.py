@@ -746,8 +746,27 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertNotIn("bumpMessagesRefreshGen", js)
 		self.assertNotIn("setSearch:", js)
 		self.assertNotIn("setFilter:", js)
+		self.assertNotIn("setDraft:", js)
 		self.assertIn("window.__omnichannelRealtime", js)
 		self.assertIn("getState:", js)
+		self.assertIn("sendMessage: sendMessage", js)
+
+	def test_send_message_uses_inflight_guard_and_stable_nonce(self):
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		self.assertIn("sending: false", js)
+		self.assertIn("if (state.sending) return", js)
+		self.assertIn("function nonceForDraft", js)
+		self.assertIn("function onDraftInput", js)
+		self.assertIn("clearSendAttempt()", js)
+		self.assertIn("client_nonce: clientNonce", js)
+		# Draft cleared only on confirmed success — not on every HTTP 200.
+		send_fn = js[js.index("async function sendMessage") : js.index("function patchPreservedChatHeader")]
+		self.assertIn("result && result.ok", send_fn)
+		self.assertIn("state.draft = \"\"", send_fn)
+		self.assertIn("result.uncertain", send_fn)
+		self.assertIn("myGen !== sendGeneration", send_fn)
+		# Composer disables while sending.
+		self.assertIn("!state.sending", js)
 
 
 def _find_node_executable() -> Optional[str]:
@@ -921,7 +940,8 @@ const root = createEl("div");
 root.id = "omnichannel-app";
 root.querySelector = (sel) => queryOne(root, sel);
 
-const gate = { list: [], messages: [], panel: [] };
+const gate = { list: [], messages: [], panel: [], send: [] };
+let nonceSeq = 0;
 function defer() {
   let settled = false;
   let resolve, reject;
@@ -1040,6 +1060,12 @@ const sandbox = {
   csrf_token: "t",
   omnichannelBoot: { lang: "en", user: "agent@example.com", csrf_token: "t" },
   frappe: { realtime: realtime },
+  crypto: {
+    randomUUID() {
+      nonceSeq += 1;
+      return "nonce-" + nonceSeq;
+    },
+  },
   document: {
     activeElement: null,
     getElementById(id) { return id === "omnichannel-app" ? root : null; },
@@ -1067,6 +1093,17 @@ const sandbox = {
       const panel = await entry.d;
       return { ok: true, json: async () => ({ message: panel }) };
     }
+    if (path.indexOf("send_message") !== -1) {
+      const entry = {
+        conversation: params.get("conversation"),
+        text: params.get("text") || "",
+        client_nonce: params.get("client_nonce") || "",
+        d: defer(),
+      };
+      gate.send.push(entry);
+      const payload = await entry.d;
+      return { ok: true, json: async () => ({ message: payload }) };
+    }
     return { ok: true, json: async () => ({ message: { ok: true } }) };
   },
 };
@@ -1089,6 +1126,7 @@ const harnessOnlyMutators =
   "bumpMessagesRefreshGen: function () { messagesRefreshGen += 1; return messagesRefreshGen; },\n" +
   "    setSearch: function (value) { state.search = value || \"\"; },\n" +
   "    setFilter: function (value) { state.filter = value || \"all\"; },\n" +
+  "    setDraft: function (value) { onDraftInput(value == null ? \"\" : String(value)); },\n" +
   "    ";
 const instrumentedSrc = publishedSrc.replace(
   "window.__omnichannelRealtime = {",
@@ -1100,6 +1138,8 @@ const api = sandbox.__omnichannelRealtime;
 assert.ok(api, "realtime test surface missing");
 assert.strictEqual(typeof api.bumpMessagesRefreshGen, "function");
 assert.strictEqual(typeof api.setSearch, "function");
+assert.strictEqual(typeof api.setDraft, "function");
+assert.strictEqual(typeof api.sendMessage, "function");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function waitUntil(fn, label, tries = 100) {
@@ -1108,6 +1148,43 @@ async function waitUntil(fn, label, tries = 100) {
     await sleep(10);
   }
   throw new Error("timeout: " + label + " list=" + gate.list.length + " messages=" + gate.messages.length);
+}
+
+async function openReadyConversation(row, messages) {
+  const openP = api.openConversation(row);
+  await waitUntil(() => gate.messages.length >= 1, "open messages");
+  gate.messages[gate.messages.length - 1].d.resolve(messages || []);
+  await waitUntil(() => gate.panel.length >= 1, "open panel");
+  gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+  await openP;
+}
+
+async function settlePostSendRefresh() {
+  // Success path awaits openConversation + loadList — resolve gates as they appear.
+  for (let i = 0; i < 200; i++) {
+    for (const entry of gate.messages) {
+      if (!entry.d.isSettled()) {
+        entry.d.resolve([
+          {
+            name: "m-out",
+            direction: "Outbound",
+            message_type: "Text",
+            text_content: "hi",
+            sent_at: "1",
+          },
+        ]);
+      }
+    }
+    for (const entry of gate.panel) {
+      if (!entry.d.isSettled()) entry.d.resolve({ lead: null, notes: [] });
+    }
+    for (const entry of gate.list) {
+      if (!entry.d.isSettled()) entry.d.resolve(bootItems);
+    }
+    if (api.getState().sending === false) return;
+    await sleep(10);
+  }
+  throw new Error("timeout settling post-send refresh");
 }
 
 const bootItems = [
@@ -1531,6 +1608,229 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "send_double_click_one_request") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("hello world");
+    const p1 = api.sendMessage();
+    const p2 = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send pending");
+    assert.strictEqual(gate.send.length, 1, "in-flight guard allows one API send");
+    assert.strictEqual(api.getState().sending, true);
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await p1;
+    await p2;
+    await settle;
+    assert.strictEqual(gate.send.length, 1);
+    assert.strictEqual(api.getState().draft, "");
+    assert.strictEqual(api.getState().sending, false);
+    console.log("OK send_double_click_one_request");
+    return;
+  }
+
+  if (scenario === "send_success_clears_draft") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("ship it");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send");
+    assert.ok(gate.send[0].client_nonce);
+    assert.strictEqual(gate.send[0].text, "ship it");
+    assert.strictEqual(api.getSendAttemptNonce(), gate.send[0].client_nonce);
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().draft, "");
+    assert.strictEqual(api.getSendAttemptNonce(), null);
+    console.log("OK send_success_clears_draft");
+    return;
+  }
+
+  if (scenario === "send_failure_keeps_draft_and_nonce") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("keep me");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send fail");
+    const nonce1 = gate.send[0].client_nonce;
+    assert.ok(nonce1);
+    assert.strictEqual(api.getSendAttemptNonce(), nonce1);
+    gate.send[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle after fail");
+    assert.strictEqual(api.getState().draft, "keep me");
+    assert.strictEqual(api.getSendAttemptNonce(), nonce1, "retry reuses nonce");
+    assert.ok(api.getState().error);
+
+    // Same draft retry must reuse the nonce (backend dedupe).
+    const p2 = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 2, "retry send");
+    assert.strictEqual(gate.send[1].client_nonce, nonce1);
+    gate.send[1].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: true,
+    });
+    await p2;
+    await waitUntil(() => api.getState().sending === false, "idle after retry");
+
+    // Editing the draft starts a new attempt.
+    api.setDraft("keep me edited");
+    assert.strictEqual(api.getSendAttemptNonce(), null, "edit clears prior nonce");
+    const p3 = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 3, "edited send");
+    assert.notStrictEqual(gate.send[2].client_nonce, nonce1);
+    gate.send[2].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p3;
+    await waitUntil(() => api.getState().sending === false, "idle after edit");
+    console.log("OK send_failure_keeps_draft_and_nonce");
+    return;
+  }
+
+  if (scenario === "send_queued_dedupe_keeps_draft") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("still typing");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "queued send");
+    gate.send[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Queued",
+      error: "Delivery has not been confirmed",
+      deduplicated: true,
+      message: "MSG-Q",
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle queued");
+    assert.strictEqual(api.getState().draft, "still typing", "Queued must not clear draft");
+    assert.strictEqual(gate.send.length, 1, "no automatic resend for Queued");
+    console.log("OK send_queued_dedupe_keeps_draft");
+    return;
+  }
+
+  if (scenario === "send_uncertain_keeps_draft_no_autoresend") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("maybe");
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "uncertain send");
+    gate.send[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "Connector request timed out",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle uncertain");
+    assert.strictEqual(api.getState().draft, "maybe");
+    assert.strictEqual(gate.send.length, 1, "no automatic resend after timeout");
+    assert.ok(String(api.getState().error || "").length > 0);
+    console.log("OK send_uncertain_keeps_draft_no_autoresend");
+    return;
+  }
+
+  if (scenario === "send_switch_conversation_ignores_stale") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(rowA, []);
+    api.setDraft("for A");
+    const pSend = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send A");
+    // Switch conversation while send is in flight.
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length >= 2, "open B messages");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length >= 2, "open B panel");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    api.setDraft("for B newer");
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-A",
+      deduplicated: false,
+    });
+    await pSend;
+    await waitUntil(() => api.getState().sending === false, "send finished");
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    assert.strictEqual(api.getState().draft, "for B newer", "stale success must not clear newer draft");
+    console.log("OK send_switch_conversation_ignores_stale");
+    return;
+  }
+
   throw new Error("unknown scenario " + scenario);
 })().catch((err) => {
   console.error(err && err.stack ? err.stack : err);
@@ -1609,6 +1909,30 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_registration_error_keeps_retrying(self):
 		out = self._run_scenario("registration_error_keeps_retrying")
 		self.assertIn("OK registration_error_keeps_retrying", out)
+
+	def test_send_double_click_one_request(self):
+		out = self._run_scenario("send_double_click_one_request")
+		self.assertIn("OK send_double_click_one_request", out)
+
+	def test_send_success_clears_draft(self):
+		out = self._run_scenario("send_success_clears_draft")
+		self.assertIn("OK send_success_clears_draft", out)
+
+	def test_send_failure_keeps_draft_and_nonce(self):
+		out = self._run_scenario("send_failure_keeps_draft_and_nonce")
+		self.assertIn("OK send_failure_keeps_draft_and_nonce", out)
+
+	def test_send_uncertain_keeps_draft_no_autoresend(self):
+		out = self._run_scenario("send_uncertain_keeps_draft_no_autoresend")
+		self.assertIn("OK send_uncertain_keeps_draft_no_autoresend", out)
+
+	def test_send_queued_dedupe_keeps_draft(self):
+		out = self._run_scenario("send_queued_dedupe_keeps_draft")
+		self.assertIn("OK send_queued_dedupe_keeps_draft", out)
+
+	def test_send_switch_conversation_ignores_stale(self):
+		out = self._run_scenario("send_switch_conversation_ignores_stale")
+		self.assertIn("OK send_switch_conversation_ignores_stale", out)
 
 
 if __name__ == "__main__":

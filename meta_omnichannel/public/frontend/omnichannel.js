@@ -394,7 +394,40 @@
     error: "",
     loadingList: false,
     loadingChat: false,
+    sending: false,
   };
+
+  /** One nonce per logical send attempt (conversation + unchanged draft text). */
+  let sendAttempt = { conversation: null, draftText: null, nonce: null };
+  let sendGeneration = 0;
+
+  function clearSendAttempt() {
+    sendAttempt = { conversation: null, draftText: null, nonce: null };
+  }
+
+  function nonceForDraft(conversationName, text) {
+    const trimmed = (text || "").trim();
+    if (
+      sendAttempt.nonce &&
+      sendAttempt.conversation === conversationName &&
+      sendAttempt.draftText === trimmed
+    ) {
+      return sendAttempt.nonce;
+    }
+    const next = nonce();
+    sendAttempt = { conversation: conversationName, draftText: trimmed, nonce: next };
+    return next;
+  }
+
+  function onDraftInput(value) {
+    state.draft = value;
+    const trimmed = (value || "").trim();
+    if (sendAttempt.draftText != null && trimmed !== sendAttempt.draftText) {
+      // Editing starts a new logical attempt — do not reuse the old nonce.
+      clearSendAttempt();
+      sendGeneration += 1;
+    }
+  }
 
   const REALTIME_EVENT = "omnichannel_conversation_updated";
   const REALTIME_DEBOUNCE_MS = 400;
@@ -651,8 +684,11 @@
     state.draft = "";
     state.note = "";
     state.loadingChat = false;
+    state.sending = false;
     pendingSoftMessageRefresh = null;
     pendingScrollToLatest = false;
+    clearSendAttempt();
+    sendGeneration += 1;
     state.error = t("empty_chat");
     messagesRefreshGen += 1;
     openConversationSeq += 1;
@@ -798,19 +834,53 @@
   }
 
   async function sendMessage() {
-    if (!state.selected || !state.draft.trim()) return;
+    // Synchronous in-flight guard — second click cannot start another request.
+    if (state.sending) return;
+    if (!state.selected || state.selected.provider !== "Facebook") return;
+    const text = (state.draft || "").trim();
+    if (!text) return;
+
+    const conversationName = state.selected.name;
+    const clientNonce = nonceForDraft(conversationName, text);
+    const myGen = ++sendGeneration;
+    state.sending = true;
+    state.error = "";
+    render();
     try {
       const result = await call("meta_omnichannel.api.inbox.send_message", {
-        conversation: state.selected.name,
-        text: state.draft,
-        client_nonce: nonce(),
+        conversation: conversationName,
+        text: text,
+        client_nonce: clientNonce,
       });
-      if (!result.ok) state.error = result.error || "Send failed";
-      state.draft = "";
-      await openConversation(state.selected);
-      await loadList();
+      // Stale response: user switched thread or edited the draft mid-flight.
+      if (myGen !== sendGeneration) return;
+      if (!state.selected || state.selected.name !== conversationName) return;
+      if ((state.draft || "").trim() !== text) return;
+
+      if (result && result.ok) {
+        state.draft = "";
+        clearSendAttempt();
+        state.error = "";
+        await openConversation(state.selected);
+        await loadList();
+        return;
+      }
+
+      // Definitive failure or uncertain delivery — keep draft + nonce; never auto-resend.
+      if (result && result.uncertain) {
+        state.error = result.error || "Delivery has not been confirmed";
+      } else {
+        state.error = (result && result.error) || "Send failed";
+      }
+      render();
     } catch (e) {
+      if (myGen !== sendGeneration) return;
+      if (!state.selected || state.selected.name !== conversationName) return;
+      if ((state.draft || "").trim() !== text) return;
       state.error = e.message || String(e);
+      render();
+    } finally {
+      state.sending = false;
       render();
     }
   }
@@ -974,13 +1044,15 @@
         chat.appendChild(msgs);
       }
       const composer = el("div", { className: "oc-composer" });
+      const canCompose =
+        !!state.selected && state.selected.provider === "Facebook" && !state.sending;
       const ta = el("textarea", {
         rows: "3",
         placeholder: t("composer_placeholder"),
         value: state.draft,
-        disabled: !state.selected || (state.selected && state.selected.provider !== "Facebook"),
+        disabled: !canCompose,
         oninput: (e) => {
-          state.draft = e.target.value;
+          onDraftInput(e.target.value);
         },
       });
       composer.appendChild(ta);
@@ -989,7 +1061,7 @@
           className: "oc-btn",
           type: "button",
           text: t("send"),
-          disabled: !state.selected || !state.selected || state.selected.provider !== "Facebook",
+          disabled: !canCompose,
           onclick: sendMessage,
         })
       );
@@ -1257,6 +1329,7 @@
     softRefreshMessages: softRefreshMessages,
     softLoadList: softLoadList,
     openConversation: openConversation,
+    sendMessage: sendMessage,
     drainPendingSoftMessageRefresh: drainPendingSoftMessageRefresh,
     getPendingSoftMessageRefresh: function () {
       return pendingSoftMessageRefresh;
@@ -1264,14 +1337,19 @@
     getOpenConversationSeq: function () {
       return openConversationSeq;
     },
+    getSendAttemptNonce: function () {
+      return sendAttempt.nonce;
+    },
     getState: function () {
       return {
         selected: state.selected && state.selected.name,
         loadingChat: state.loadingChat,
+        sending: state.sending,
         draft: state.draft,
         note: state.note,
         search: state.search,
         filter: state.filter,
+        error: state.error,
         messageCount: state.messages.length,
         conversationCount: state.conversations.length,
         panel: state.panel,
