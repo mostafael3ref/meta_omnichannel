@@ -613,6 +613,54 @@
     return next;
   }
 
+  function composerCanCompose() {
+    return !!state.selected && state.selected.provider === "Facebook" && !state.sending;
+  }
+
+  function composerCanSend() {
+    const imageDraft = currentImageDraft();
+    const hasImage = !!(imageDraft && imageDraft.file);
+    const imageBlocked = !!(hasImage && imageDraft.blockResend);
+    return composerCanCompose() && !imageBlocked && (hasImage || !!(state.draft || "").trim());
+  }
+
+  /**
+   * Patch live composer controls without a full render.
+   * Needed because draft input updates state.draft but does not rebuild the DOM;
+   * otherwise Send stays disabled after a successful clear until the next render.
+   */
+  function syncComposerControls() {
+    if (!root) return;
+    const canCompose = composerCanCompose();
+    const canSend = composerCanSend();
+    const imageDraft = currentImageDraft();
+    const hasImage = !!(imageDraft && imageDraft.file);
+    const sendBtn = root.querySelector(".oc-composer-send");
+    if (sendBtn) {
+      sendBtn.disabled = !canSend;
+      sendBtn.textContent =
+        hasImage && (state.draft || "").trim()
+          ? t("send")
+          : hasImage
+            ? t("send_image")
+            : t("send");
+    }
+    const ta = root.querySelector(".oc-composer textarea");
+    if (ta) ta.disabled = !canCompose;
+    const attach = root.querySelector(".oc-composer-attach");
+    if (attach) attach.disabled = !canCompose;
+    const fileInput = root.querySelector(".oc-composer-file");
+    if (fileInput) fileInput.disabled = !canCompose;
+    const removeBtn = root.querySelector(".oc-composer-remove");
+    if (removeBtn) removeBtn.disabled = !!state.sending;
+    const hint = root.querySelector(".oc-composer-hint");
+    if (hint && hasImage) {
+      hint.textContent = (state.draft || "").trim()
+        ? t("image_and_text_hint")
+        : t("image_only_hint");
+    }
+  }
+
   function onDraftInput(value) {
     state.draft = value;
     const trimmed = (value || "").trim();
@@ -621,6 +669,7 @@
       clearSendAttempt();
       sendGeneration += 1;
     }
+    syncComposerControls();
   }
 
   const REALTIME_EVENT = "omnichannel_conversation_updated";
@@ -1479,13 +1528,10 @@
         chat.appendChild(msgs);
       }
       const composer = el("div", { className: "oc-composer" });
-      const canCompose =
-        !!state.selected && state.selected.provider === "Facebook" && !state.sending;
+      const canCompose = composerCanCompose();
+      const canSend = composerCanSend();
       const imageDraft = currentImageDraft();
       const hasImage = !!(imageDraft && imageDraft.file);
-      const imageBlocked = !!(hasImage && imageDraft.blockResend);
-      const canSend =
-        canCompose && !imageBlocked && (hasImage || !!(state.draft || "").trim());
 
       if (hasImage) {
         const preview = el("div", { className: "oc-composer-preview" });
@@ -1571,7 +1617,7 @@
       row.appendChild(ta);
       row.appendChild(
         el("button", {
-          className: "oc-btn",
+          className: "oc-btn oc-composer-send",
           type: "button",
           text:
             hasImage && (state.draft || "").trim()
@@ -1903,8 +1949,11 @@
         conversationCount: state.conversations.length,
         panel: state.panel,
         hasImageDraft: !!(currentImageDraft() && currentImageDraft().file),
+        canCompose: composerCanCompose(),
+        canSend: composerCanSend(),
       };
     },
+    syncComposerControls: syncComposerControls,
     isSubscribed: function () {
       return realtimeSubscribed;
     },

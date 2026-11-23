@@ -791,6 +791,8 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("image_and_text_hint", js)
 		self.assertIn("image_sent_text_pending", js)
 		self.assertIn("function sendCombinedImageAndText", js)
+		self.assertIn("function syncComposerControls", js)
+		self.assertIn("oc-composer-send", js)
 		self.assertIn("oc-composer-attach", js)
 		self.assertIn("accept: \"image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif\"", js)
 		# Captions unsupported — multipart image request must not append draft text.
@@ -888,6 +890,12 @@ function createEl(tag) {
       if (k === "value") node.value = v;
       if (k === "type") node.type = String(v);
       if (k === "class") node.className = v;
+      // Mirror browser: presence of disabled attribute disables the control.
+      if (k === "disabled") node.disabled = true;
+    },
+    removeAttribute(k) {
+      delete attrs[k];
+      if (k === "disabled") node.disabled = false;
     },
     getAttribute(k) { return attrs[k]; },
     addEventListener(type, fn) {
@@ -2342,6 +2350,176 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  function sendButton() {
+    return root.querySelector(".oc-composer-send");
+  }
+
+  if (scenario === "composer_reenables_after_text_send") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("first");
+    assert.strictEqual(sendButton().disabled, false);
+    const p = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send1");
+    assert.strictEqual(api.getState().sending, true);
+    assert.strictEqual(sendButton().disabled, true);
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().sending, false);
+    assert.strictEqual(api.getState().draft, "");
+    assert.strictEqual(sendButton().disabled, true, "empty draft disables send");
+    api.setDraft("second");
+    assert.strictEqual(api.getState().canSend, true);
+    assert.strictEqual(sendButton().disabled, false, "typing re-enables without refresh");
+    const p2 = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 2, "send2");
+    assert.strictEqual(gate.send[1].text, "second");
+    gate.send[1].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-2",
+      deduplicated: false,
+    });
+    const settle2 = settlePostSendRefresh();
+    await p2;
+    await settle2;
+    assert.strictEqual(api.getState().sending, false);
+    console.log("OK composer_reenables_after_text_send");
+    return;
+  }
+
+  if (scenario === "composer_reenables_after_combined_send") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("with image");
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "x.png", type: "image/png", size: 8 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "img");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "txt");
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-TXT",
+      deduplicated: false,
+    });
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().sending, false);
+    assert.strictEqual(api.getState().hasImageDraft, false);
+    assert.strictEqual(api.getState().draft, "");
+    assert.strictEqual(sendButton().disabled, true);
+    api.setDraft("again");
+    assert.strictEqual(sendButton().disabled, false);
+    console.log("OK composer_reenables_after_combined_send");
+    return;
+  }
+
+  if (scenario === "composer_unlocks_after_image_unknown") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.selectComposerImage(makeImageFile({ name: "u.png", type: "image/png", size: 8 })));
+    const p = api.sendImageMessage();
+    await waitUntil(() => gate.sendImage.length >= 1, "unknown");
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "unlocked");
+    assert.strictEqual(api.getState().sending, false);
+    assert.ok(api.getImageDraft().blockResend);
+    assert.strictEqual(api.getState().canSend, false, "uncertain image still blocks send");
+    api.removeComposerImage();
+    api.setDraft("text only now");
+    assert.strictEqual(api.getState().sending, false);
+    assert.strictEqual(sendButton().disabled, false);
+    console.log("OK composer_unlocks_after_image_unknown");
+    return;
+  }
+
+  if (scenario === "composer_unlocks_on_switch_during_send") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(rowA, []);
+    api.setDraft("for A");
+    const pSend = api.sendMessage();
+    await waitUntil(() => gate.send.length >= 1, "send A");
+    assert.strictEqual(api.getState().sending, true);
+    const msgBefore = gate.messages.length;
+    const panelBefore = gate.panel.length;
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length > msgBefore, "open B");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBefore, "panel B");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-A",
+      deduplicated: false,
+    });
+    await pSend;
+    await waitUntil(() => api.getState().sending === false, "lock released");
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    api.setDraft("for B");
+    assert.strictEqual(sendButton().disabled, false);
+    console.log("OK composer_unlocks_on_switch_during_send");
+    return;
+  }
+
   if (scenario === "combined_switch_during_image_defers_text") {
     const rowA = {
       name: "CONV-A",
@@ -2555,6 +2733,22 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_combined_switch_during_image_defers_text(self):
 		out = self._run_scenario("combined_switch_during_image_defers_text")
 		self.assertIn("OK combined_switch_during_image_defers_text", out)
+
+	def test_composer_reenables_after_text_send(self):
+		out = self._run_scenario("composer_reenables_after_text_send")
+		self.assertIn("OK composer_reenables_after_text_send", out)
+
+	def test_composer_reenables_after_combined_send(self):
+		out = self._run_scenario("composer_reenables_after_combined_send")
+		self.assertIn("OK composer_reenables_after_combined_send", out)
+
+	def test_composer_unlocks_after_image_unknown(self):
+		out = self._run_scenario("composer_unlocks_after_image_unknown")
+		self.assertIn("OK composer_unlocks_after_image_unknown", out)
+
+	def test_composer_unlocks_on_switch_during_send(self):
+		out = self._run_scenario("composer_unlocks_on_switch_during_send")
+		self.assertIn("OK composer_unlocks_on_switch_during_send", out)
 
 
 if __name__ == "__main__":
