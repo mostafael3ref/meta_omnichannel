@@ -59,3 +59,34 @@ def outbound_image_nonce_key_prefix(*, conversation_name: str, client_nonce: str
 		conversation_name=conversation_name,
 		client_nonce=client_nonce,
 	)
+
+
+def build_outbound_document_idempotency_key(
+	*,
+	conversation_name: str,
+	client_nonce: str,
+	content_sha256: str | None = None,
+) -> str:
+	"""DB reservation key for one outbound document nonce (conversation + nonce only).
+
+	Namespace is ``oc-doc:`` so document and image nonces never share a unique key.
+	Content SHA-256 is intentionally **not** part of the unique key. Callers store the
+	hash in ``raw_payload_hash`` for same-nonce / different-bytes conflict detection.
+
+	``content_sha256`` is accepted for call-site compatibility and ignored for keying.
+	"""
+	conversation_name = (conversation_name or "").strip()
+	client_nonce = (client_nonce or "").strip()
+	if not conversation_name or not client_nonce:
+		raise ValueError("conversation_name and client_nonce are required")
+	_ = content_sha256
+	raw = f"oc-doc:{conversation_name}:{client_nonce}"
+	return _SAFE.sub("-", raw)[:140]
+
+
+def outbound_document_nonce_key_prefix(*, conversation_name: str, client_nonce: str) -> str:
+	"""Exact nonce-scoped document key prefix (equals the reservation key)."""
+	return build_outbound_document_idempotency_key(
+		conversation_name=conversation_name,
+		client_nonce=client_nonce,
+	)

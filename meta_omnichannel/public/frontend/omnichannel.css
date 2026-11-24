@@ -247,6 +247,20 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   flex: 0 0 auto;
   background: rgba(0, 0, 0, .04);
 }
+.oc-composer-doc-badge {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(15, 118, 110, .12);
+  color: var(--oc-accent, #0f766e);
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
 .oc-composer-preview-meta {
   min-width: 0;
   flex: 1 1 auto;
@@ -257,6 +271,11 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.oc-composer-filesize {
+  margin-top: .1rem;
+  font-size: .78rem;
+  color: var(--oc-muted);
 }
 .oc-composer-hint {
   margin-top: .15rem;

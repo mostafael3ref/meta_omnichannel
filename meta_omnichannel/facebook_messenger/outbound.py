@@ -12,8 +12,13 @@ from frappe import _
 from frappe.utils import now_datetime
 
 from meta_omnichannel.facebook_messenger.adapter import (
+	MAX_OUTBOUND_DOCUMENT_BYTES,
 	MAX_OUTBOUND_IMAGE_BYTES,
 	FacebookConnectorAdapter,
+	_OUTBOUND_DOCUMENT_DEFAULT_NAME,
+	_OUTBOUND_DOCUMENT_TYPES,
+	_detect_outbound_document_mime,
+	_normalize_outbound_document_content_type,
 )
 from meta_omnichannel.meta_connectors.errors import (
 	ConnectorError,
@@ -21,6 +26,7 @@ from meta_omnichannel.meta_connectors.errors import (
 	ConnectorUnreachableError,
 )
 from meta_omnichannel.utils.idempotency import (
+	build_outbound_document_idempotency_key,
 	build_outbound_idempotency_key,
 	build_outbound_image_idempotency_key,
 )
@@ -29,8 +35,9 @@ _CONFIRMED_OK = frozenset({"Sent", "Delivered", "Read"})
 _UNCERTAIN = frozenset({"Unknown", "Queued", "Pending"})
 # Ambiguous outcomes: Meta may already have accepted the send.
 _UNCERTAIN_EXCEPTIONS = (ConnectorUnreachableError, ConnectorServerError)
-_IMAGE_SEND_LOCK_TTL_SEC = 120
+_MEDIA_SEND_LOCK_TTL_SEC = 120
 _IMAGE_SEND_LOCK_PREFIX = "omnichannel:fb_send_img"
+_DOCUMENT_SEND_LOCK_PREFIX = "omnichannel:fb_send_doc"
 _RELEASE_LOCK_IF_OWNER = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
 	return redis.call('del', KEYS[1])
@@ -258,7 +265,34 @@ def _validate_outbound_image_bytes(
 	return payload, detected
 
 
-def _load_image_reservation(idem: str):
+def _validate_outbound_document_bytes(
+	document_bytes: bytes, *, content_type: str | None = None
+) -> tuple[bytes, str]:
+	"""Return ``(payload, detected_mime)`` or throw before any persistence."""
+	if not isinstance(document_bytes, (bytes, bytearray)):
+		frappe.throw(_("Document bytes are required"), frappe.ValidationError)
+	payload = bytes(document_bytes)
+	if not payload:
+		frappe.throw(_("Document bytes are required"), frappe.ValidationError)
+	if len(payload) > MAX_OUTBOUND_DOCUMENT_BYTES:
+		frappe.throw(_("Document exceeds 8 MiB limit"), frappe.ValidationError)
+
+	detected = _detect_outbound_document_mime(payload)
+	if not detected:
+		frappe.throw(_("Document must be a PDF or DOCX file"), frappe.ValidationError)
+
+	declared = _normalize_outbound_document_content_type(content_type or "")
+	if declared and declared not in _OUTBOUND_DOCUMENT_TYPES:
+		frappe.throw(_("Document must be a PDF or DOCX file"), frappe.ValidationError)
+	if declared and declared != detected:
+		frappe.throw(
+			_("Document content does not match the declared MIME type"),
+			frappe.ValidationError,
+		)
+	return payload, detected
+
+
+def _load_media_reservation(idem: str):
 	"""Load the unique nonce reservation row, including content hash."""
 	return frappe.db.get_value(
 		"Omnichannel Message",
@@ -268,20 +302,33 @@ def _load_image_reservation(idem: str):
 	)
 
 
-def _response_for_image_reservation(existing, *, content_sha: str) -> dict:
+def _load_image_reservation(idem: str):
+	"""Backward-compatible alias for image callers/tests."""
+	return _load_media_reservation(idem)
+
+
+def _response_for_media_reservation(
+	existing, *, content_sha: str, conflict_noun: str
+) -> dict:
 	"""Dedupe or conflict against a reserved nonce row (never calls Connector)."""
 	stored = (getattr(existing, "raw_payload_hash", None) or "").strip().lower()
 	incoming = (content_sha or "").strip().lower()
 	if stored and incoming and stored != incoming:
-		return _conflict_response(existing)
+		return _conflict_response(existing, conflict_noun=conflict_noun)
 	payload = _response_for_existing(existing, deduplicated=True)
 	payload["conflict"] = False
 	return payload
 
 
+def _response_for_image_reservation(existing, *, content_sha: str) -> dict:
+	return _response_for_media_reservation(
+		existing, content_sha=content_sha, conflict_noun="image"
+	)
+
+
 @contextmanager
-def _image_send_nonce_lock(
-	conversation_name: str, client_nonce: str
+def _media_send_nonce_lock(
+	conversation_name: str, client_nonce: str, *, lock_prefix: str
 ) -> Iterator[tuple[bool, bool]]:
 	"""Serialize sends for one conversation+nonce.
 
@@ -291,7 +338,7 @@ def _image_send_nonce_lock(
 	- owned=False, redis_available=False: Redis failed — callers must rely on the
 	  unique DB reservation key (fail closed only if that insert cannot be fenced).
 	"""
-	logical = f"{_IMAGE_SEND_LOCK_PREFIX}:{conversation_name}:{client_nonce}"
+	logical = f"{lock_prefix}:{conversation_name}:{client_nonce}"
 	token = secrets.token_hex(16)
 	owned = False
 	redis_available = True
@@ -299,7 +346,7 @@ def _image_send_nonce_lock(
 	try:
 		cache = frappe.cache()
 		key = cache.make_key(logical) if hasattr(cache, "make_key") else logical
-		raw = cache.set(key, token, nx=True, ex=_IMAGE_SEND_LOCK_TTL_SEC)
+		raw = cache.set(key, token, nx=True, ex=_MEDIA_SEND_LOCK_TTL_SEC)
 		owned = raw is True or raw == 1
 	except Exception:
 		owned = False
@@ -320,7 +367,18 @@ def _image_send_nonce_lock(
 					pass
 
 
-def _conflict_response(existing) -> dict:
+@contextmanager
+def _image_send_nonce_lock(
+	conversation_name: str, client_nonce: str
+) -> Iterator[tuple[bool, bool]]:
+	"""Backward-compatible image lock wrapper."""
+	with _media_send_nonce_lock(
+		conversation_name, client_nonce, lock_prefix=_IMAGE_SEND_LOCK_PREFIX
+	) as state:
+		yield state
+
+
+def _conflict_response(existing, *, conflict_noun: str = "image") -> dict:
 	return {
 		"ok": False,
 		"uncertain": False,
@@ -328,68 +386,86 @@ def _conflict_response(existing) -> dict:
 		"deduplicated": False,
 		"message": existing.name if existing else None,
 		"delivery_status": (existing.delivery_status if existing else "Failed") or "Failed",
-		"error": _("This nonce was already used with a different image"),
+		"error": _("This nonce was already used with a different {0}").format(conflict_noun),
 	}
 
 
-def _in_progress_response() -> dict:
+def _in_progress_response(*, error: str | None = None) -> dict:
 	return {
 		"ok": False,
 		"uncertain": True,
 		"deduplicated": False,
 		"conflict": False,
 		"delivery_status": "Queued",
-		"error": _("An image send with this nonce is already in progress"),
+		"error": error or _("An image send with this nonce is already in progress"),
 	}
 
 
-def send_facebook_image(
+def _extract_connector_message_id(result) -> str | None:
+	if not isinstance(result, dict):
+		return None
+	external_id = (
+		result.get("message_id")
+		or result.get("id")
+		or result.get("mid")
+		or result.get("external_message_id")
+	)
+	if external_id is None:
+		return None
+	text = str(external_id).strip()
+	return text or None
+
+
+def _send_facebook_binary_attachment(
 	*,
 	conversation_name: str,
 	client_nonce: str,
-	image_bytes: bytes,
-	filename: str | None = None,
-	content_type: str | None = None,
+	payload: bytes,
+	mime: str,
+	filename: str | None,
+	content_sha: str,
+	build_idempotency_key,
+	lock_prefix: str,
+	message_type: str,
+	preview_label: str,
+	conflict_noun: str,
+	in_progress_error: str,
+	default_filename: str,
+	attach_callable,
+	adapter_send_callable,
+	require_connector_message_id: bool,
 ) -> dict:
-	"""Send one outbound image via Connector multipart upload; persist private File first.
-
-	Concurrency fence: unique ``idempotency_key`` is nonce-scoped (conversation + nonce).
-	Image bytes are hashed into ``raw_payload_hash``. Redis NX is an accelerator; when
-	Redis is down the unique key still prevents a second Connector call.
-	"""
-	client_nonce = (client_nonce or "").strip()
-	if not client_nonce:
-		frappe.throw(_("client_nonce is required"), frappe.ValidationError)
-
-	payload, mime = _validate_outbound_image_bytes(image_bytes, content_type=content_type)
-	content_sha = hashlib.sha256(payload).hexdigest()
-
+	"""Shared Facebook outbound binary pipeline (image / document)."""
 	conv = frappe.get_doc("Omnichannel Conversation", conversation_name)
 	if conv.provider != "Facebook":
 		frappe.throw(_("Conversation provider does not support Facebook send"))
 
-	idem = build_outbound_image_idempotency_key(
+	idempotency_key = build_idempotency_key(
 		conversation_name=conv.name,
 		client_nonce=client_nonce,
 		content_sha256=content_sha,
 	)
 
-	with _image_send_nonce_lock(conv.name, client_nonce) as (got_lock, redis_available):
-		existing = _load_image_reservation(idem)
+	with _media_send_nonce_lock(
+		conv.name, client_nonce, lock_prefix=lock_prefix
+	) as (got_lock, redis_available):
+		existing = _load_media_reservation(idempotency_key)
 		if existing:
-			return _response_for_image_reservation(existing, content_sha=content_sha)
+			return _response_for_media_reservation(
+				existing, content_sha=content_sha, conflict_noun=conflict_noun
+			)
 
 		if not got_lock and redis_available:
-			# Peer holds Redis lock — do not start a second Meta send.
-			existing = _load_image_reservation(idem)
+			existing = _load_media_reservation(idempotency_key)
 			if existing:
-				return _response_for_image_reservation(existing, content_sha=content_sha)
-			return _in_progress_response()
+				return _response_for_media_reservation(
+					existing, content_sha=content_sha, conflict_noun=conflict_noun
+				)
+			return _in_progress_response(error=in_progress_error)
 
-		# got_lock OR Redis unavailable: DB unique key is the authoritative fence.
 		safe_name = (filename or "").strip().replace("\\", "_").replace("/", "_")
 		if not safe_name:
-			safe_name = f"image.{mime.split('/', 1)[1]}"
+			safe_name = default_filename
 
 		msg = frappe.get_doc(
 			{
@@ -398,10 +474,10 @@ def send_facebook_image(
 				"channel": conv.channel,
 				"provider": "Facebook",
 				"direction": "Outbound",
-				"message_type": "Image",
+				"message_type": message_type,
 				"text_content": "",
 				"content": "",
-				"idempotency_key": idem,
+				"idempotency_key": idempotency_key,
 				"raw_payload_hash": content_sha,
 				"delivery_status": "Queued",
 				"sent_at": now_datetime(),
@@ -415,22 +491,20 @@ def send_facebook_image(
 			if not _is_duplicate_idempotency_error(exc):
 				raise
 			frappe.db.rollback()
-			existing = _load_image_reservation(idem)
+			existing = _load_media_reservation(idempotency_key)
 			if not existing:
 				raise
-			return _response_for_image_reservation(existing, content_sha=content_sha)
+			return _response_for_media_reservation(
+				existing, content_sha=content_sha, conflict_noun=conflict_noun
+			)
 
 		frappe.db.commit()
 
 		try:
-			# Lazy import: avoids pulling File helpers into text-only callers/tests.
-			from meta_omnichannel.facebook_messenger import media as fb_media
-
-			fb_media.attach_outbound_image_file(
-				msg.name, payload, mime, attachment_index=0
-			)
+			attach_callable(msg.name, payload, mime, safe_name)
 			frappe.db.commit()
 		except Exception as exc:
+			# Keep any private File / Ready child already written; mark Failed only.
 			frappe.db.set_value(
 				"Omnichannel Message",
 				msg.name,
@@ -452,22 +526,35 @@ def send_facebook_image(
 
 		try:
 			adapter = FacebookConnectorAdapter()
-			result = adapter.send_image(
+			result = adapter_send_callable(
+				adapter,
 				page_id=conv.page_id,
 				recipient_id=conv.participant_id,
-				idempotency_key=idem,
-				image_bytes=payload,
+				idempotency_key=idempotency_key,
+				payload=payload,
 				filename=safe_name,
 				content_type=mime,
 			)
-			external_id = None
-			if isinstance(result, dict):
-				external_id = (
-					result.get("message_id")
-					or result.get("id")
-					or result.get("mid")
-					or result.get("external_message_id")
+			external_id = _extract_connector_message_id(result)
+			if require_connector_message_id and not external_id:
+				frappe.db.set_value(
+					"Omnichannel Message",
+					msg.name,
+					{
+						"delivery_status": "Unknown",
+						"error_summary": _("Connector did not confirm a message id")[:440],
+					},
 				)
+				return {
+					"ok": False,
+					"uncertain": True,
+					"deduplicated": False,
+					"conflict": False,
+					"message": msg.name,
+					"delivery_status": "Unknown",
+					"error": _("Connector did not confirm a message id"),
+				}
+
 			values = {"delivery_status": "Sent"}
 			if external_id:
 				if not frappe.db.exists("Omnichannel Message", {"external_message_id": external_id}):
@@ -478,7 +565,7 @@ def send_facebook_image(
 				conv.name,
 				{
 					"last_message_at": now_datetime(),
-					"last_message_preview": _("Image")[:500],
+					"last_message_preview": (preview_label or "")[:500],
 				},
 			)
 			return {
@@ -490,6 +577,7 @@ def send_facebook_image(
 				"delivery_status": "Sent",
 			}
 		except _UNCERTAIN_EXCEPTIONS as exc:
+			# Preserve attachments; Meta may already have accepted the payload.
 			frappe.db.set_value(
 				"Omnichannel Message",
 				msg.name,
@@ -519,3 +607,126 @@ def send_facebook_image(
 				"delivery_status": "Failed",
 				"error": str(exc),
 			}
+
+
+def send_facebook_image(
+	*,
+	conversation_name: str,
+	client_nonce: str,
+	image_bytes: bytes,
+	filename: str | None = None,
+	content_type: str | None = None,
+) -> dict:
+	"""Send one outbound image via Connector multipart upload; persist private File first.
+
+	Concurrency fence: unique ``idempotency_key`` is nonce-scoped (conversation + nonce).
+	Image bytes are hashed into ``raw_payload_hash``. Redis NX is an accelerator; when
+	Redis is down the unique key still prevents a second Connector call.
+	"""
+	client_nonce = (client_nonce or "").strip()
+	if not client_nonce:
+		frappe.throw(_("client_nonce is required"), frappe.ValidationError)
+
+	payload, mime = _validate_outbound_image_bytes(image_bytes, content_type=content_type)
+	content_sha = hashlib.sha256(payload).hexdigest()
+
+	def _attach(msg_name: str, body: bytes, content_mime: str, _safe_name: str) -> None:
+		from meta_omnichannel.facebook_messenger import media as fb_media
+
+		fb_media.attach_outbound_image_file(
+			msg_name, body, content_mime, attachment_index=0
+		)
+
+	def _send(adapter, *, page_id, recipient_id, idempotency_key, payload, filename, content_type):
+		return adapter.send_image(
+			page_id=page_id,
+			recipient_id=recipient_id,
+			idempotency_key=idempotency_key,
+			image_bytes=payload,
+			filename=filename,
+			content_type=content_type,
+		)
+
+	return _send_facebook_binary_attachment(
+		conversation_name=conversation_name,
+		client_nonce=client_nonce,
+		payload=payload,
+		mime=mime,
+		filename=filename,
+		content_sha=content_sha,
+		build_idempotency_key=build_outbound_image_idempotency_key,
+		lock_prefix=_IMAGE_SEND_LOCK_PREFIX,
+		message_type="Image",
+		preview_label=_("Image"),
+		conflict_noun="image",
+		in_progress_error=_("An image send with this nonce is already in progress"),
+		default_filename=f"image.{mime.split('/', 1)[1]}",
+		attach_callable=_attach,
+		adapter_send_callable=_send,
+		# Preserve historical image behavior: Sent even if Connector omits message_id.
+		require_connector_message_id=False,
+	)
+
+
+def send_facebook_document(
+	*,
+	conversation_name: str,
+	client_nonce: str,
+	document_bytes: bytes,
+	filename: str | None = None,
+	content_type: str | None = None,
+) -> dict:
+	"""Send one outbound PDF/DOCX via Connector multipart upload; persist private File first.
+
+	Uses ``oc-doc:`` nonce-scoped idempotency keys. Content SHA-256 is stored in
+	``raw_payload_hash`` (not in the unique key). Redis NX accelerates; DB uniqueness
+	is authoritative. Marks ``Sent`` only when Connector returns a message id.
+	"""
+	client_nonce = (client_nonce or "").strip()
+	if not client_nonce:
+		frappe.throw(_("client_nonce is required"), frappe.ValidationError)
+
+	payload, mime = _validate_outbound_document_bytes(
+		document_bytes, content_type=content_type
+	)
+	content_sha = hashlib.sha256(payload).hexdigest()
+
+	def _attach(msg_name: str, body: bytes, content_mime: str, safe_name: str) -> None:
+		from meta_omnichannel.facebook_messenger import media as fb_media
+
+		fb_media.attach_outbound_document_file(
+			msg_name,
+			body,
+			content_mime,
+			filename=safe_name,
+			attachment_index=0,
+		)
+
+	def _send(adapter, *, page_id, recipient_id, idempotency_key, payload, filename, content_type):
+		return adapter.send_document(
+			page_id=page_id,
+			recipient_id=recipient_id,
+			idempotency_key=idempotency_key,
+			document_bytes=payload,
+			filename=filename,
+			content_type=content_type,
+		)
+
+	return _send_facebook_binary_attachment(
+		conversation_name=conversation_name,
+		client_nonce=client_nonce,
+		payload=payload,
+		mime=mime,
+		filename=filename,
+		content_sha=content_sha,
+		build_idempotency_key=build_outbound_document_idempotency_key,
+		lock_prefix=_DOCUMENT_SEND_LOCK_PREFIX,
+		message_type="File",
+		preview_label=_("Document"),
+		conflict_noun="document",
+		in_progress_error=_("A document send with this nonce is already in progress"),
+		default_filename=_OUTBOUND_DOCUMENT_DEFAULT_NAME.get(mime, "document.bin"),
+		attach_callable=_attach,
+		adapter_send_callable=_send,
+		require_connector_message_id=True,
+	)

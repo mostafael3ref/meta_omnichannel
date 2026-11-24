@@ -355,7 +355,9 @@ def send_message(conversation: str, text: str, client_nonce: str) -> dict:
 	)
 
 
-def _read_upload_image_bounded(upload, *, max_bytes: int) -> tuple[bytes, str | None, str | None]:
+def _read_upload_bounded(
+	upload, *, max_bytes: int, label: str
+) -> tuple[bytes, str | None, str | None]:
 	"""Read at most ``max_bytes + 1`` from the upload stream (reject oversized)."""
 	filename = getattr(upload, "filename", None) or getattr(upload, "name", None)
 	content_type = getattr(upload, "content_type", None) or getattr(upload, "mimetype", None)
@@ -365,7 +367,7 @@ def _read_upload_image_bounded(upload, *, max_bytes: int) -> tuple[bytes, str | 
 	elif hasattr(upload, "read"):
 		data = upload.read(max_bytes + 1)
 	else:
-		frappe.throw(_("Image upload is required"), frappe.ValidationError)
+		frappe.throw(_("{0} upload is required").format(label), frappe.ValidationError)
 	if data is None:
 		data = b""
 	if not isinstance(data, (bytes, bytearray)):
@@ -373,12 +375,27 @@ def _read_upload_image_bounded(upload, *, max_bytes: int) -> tuple[bytes, str | 
 	else:
 		data = bytes(data)
 	if len(data) > max_bytes:
-		frappe.throw(_("Image exceeds 8 MiB limit"), frappe.ValidationError)
+		frappe.throw(_("{0} exceeds 8 MiB limit").format(label), frappe.ValidationError)
 	if not data:
-		frappe.throw(_("Image upload is required"), frappe.ValidationError)
+		frappe.throw(_("{0} upload is required").format(label), frappe.ValidationError)
 	return data, (str(filename).strip() if filename else None), (
 		str(content_type).strip() if content_type else None
 	)
+
+
+def _read_upload_image_bounded(upload, *, max_bytes: int) -> tuple[bytes, str | None, str | None]:
+	"""Backward-compatible image upload reader (8 MiB bound)."""
+	return _read_upload_bounded(upload, max_bytes=max_bytes, label="Image")
+
+
+def _multipart_upload(field_name: str):
+	"""Return the multipart upload for ``field_name``, or None if missing."""
+	files = getattr(getattr(frappe, "request", None), "files", None) or {}
+	if hasattr(files, "get"):
+		return files.get(field_name)
+	if isinstance(files, dict):
+		return files.get(field_name)
+	return None
 
 
 @frappe.whitelist()
@@ -402,20 +419,15 @@ def send_image_message(
 			)
 		)
 
-	files = getattr(getattr(frappe, "request", None), "files", None) or {}
-	upload = None
-	if hasattr(files, "get"):
-		upload = files.get("image")
-	elif isinstance(files, dict):
-		upload = files.get("image")
+	upload = _multipart_upload("image")
 	if upload is None:
 		frappe.throw(_("Image upload is required"), frappe.ValidationError)
 
 	from meta_omnichannel.facebook_messenger.adapter import MAX_OUTBOUND_IMAGE_BYTES
 	from meta_omnichannel.facebook_messenger.outbound import send_facebook_image
 
-	image_bytes, upload_name, upload_mime = _read_upload_image_bounded(
-		upload, max_bytes=MAX_OUTBOUND_IMAGE_BYTES
+	image_bytes, upload_name, upload_mime = _read_upload_bounded(
+		upload, max_bytes=MAX_OUTBOUND_IMAGE_BYTES, label="Image"
 	)
 	safe_filename = (filename or "").strip() or upload_name
 
@@ -423,6 +435,48 @@ def send_image_message(
 		conversation_name=conversation,
 		client_nonce=client_nonce,
 		image_bytes=image_bytes,
+		filename=safe_filename,
+		content_type=upload_mime,
+	)
+
+
+@frappe.whitelist()
+def send_document_message(
+	conversation: str, client_nonce: str, filename: str | None = None
+) -> dict:
+	"""Send one Facebook Messenger PDF/DOCX from multipart field ``document``."""
+	ensure_omnichannel_agent()
+	client_nonce = (client_nonce or "").strip()
+	if not client_nonce:
+		frappe.throw(_("client_nonce is required"), frappe.ValidationError)
+
+	conv = frappe.get_doc("Omnichannel Conversation", conversation)
+	if not has_conversation_permission(conv, "write"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	if conv.provider != "Facebook":
+		frappe.throw(
+			_("Outbound messaging for {0} is not available until the connector API is confirmed").format(
+				conv.provider
+			)
+		)
+
+	upload = _multipart_upload("document")
+	if upload is None:
+		frappe.throw(_("Document upload is required"), frappe.ValidationError)
+
+	from meta_omnichannel.facebook_messenger.adapter import MAX_OUTBOUND_DOCUMENT_BYTES
+	from meta_omnichannel.facebook_messenger.outbound import send_facebook_document
+
+	document_bytes, upload_name, upload_mime = _read_upload_bounded(
+		upload, max_bytes=MAX_OUTBOUND_DOCUMENT_BYTES, label="Document"
+	)
+	safe_filename = (filename or "").strip() or upload_name
+
+	return send_facebook_document(
+		conversation_name=conversation,
+		client_nonce=client_nonce,
+		document_bytes=document_bytes,
 		filename=safe_filename,
 		content_type=upload_mime,
 	)

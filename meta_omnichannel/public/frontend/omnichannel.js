@@ -19,16 +19,23 @@
       sync: "Sync Facebook",
       send: "Send",
       send_image: "Send image",
-      attach_image: "Attach image",
+      send_document: "Send document",
+      attach_image: "Attach file",
       remove_image: "Remove",
       image_only_hint: "Only the image will be sent",
       image_and_text_hint: "Image and text are sent as two separate Messenger messages",
       image_sent_text_pending:
         "Image was sent. The text was not sent — review the draft and send when ready.",
-      image_type_rejected: "Use a JPEG, PNG, or GIF image",
-      image_too_large: "Image must be 8 MiB or smaller",
+      image_type_rejected: "Use a JPEG, PNG, GIF, PDF, or DOCX file",
+      image_too_large: "File must be 8 MiB or smaller",
       image_uncertain:
-        "Delivery is unconfirmed — the image may already have been sent. Remove this selection before choosing another image; do not resend.",
+        "Delivery is unconfirmed — the file may already have been sent. Remove this selection before choosing another file; do not resend.",
+      document_only_hint: "Only the document will be sent",
+      document_and_text_hint: "Document and text are sent as two separate Messenger messages",
+      document_sent_text_pending:
+        "Document was sent. The text was not sent — review the draft and send when ready.",
+      document_uncertain:
+        "Delivery is unconfirmed — the document may already have been sent. Remove this selection before choosing another file; do not resend.",
       composer_placeholder: "Write a message…",
       empty_list: "No conversations yet",
       empty_chat: "Select a conversation",
@@ -61,16 +68,23 @@
       sync: "مزامنة فيسبوك",
       send: "إرسال",
       send_image: "إرسال صورة",
-      attach_image: "إرفاق صورة",
+      send_document: "إرسال مستند",
+      attach_image: "إرفاق ملف",
       remove_image: "إزالة",
       image_only_hint: "ستُرسل الصورة فقط",
       image_and_text_hint: "تُرسل الصورة والنص كرسالتين منفصلتين في ماسنجر",
       image_sent_text_pending:
         "أُرسلت الصورة. لم يُرسل النص — راجع المسودة وأرسل عند الجاهزية.",
-      image_type_rejected: "استخدم صورة JPEG أو PNG أو GIF",
-      image_too_large: "يجب ألا تتجاوز الصورة 8 ميبيبايت",
+      image_type_rejected: "استخدم ملف JPEG أو PNG أو GIF أو PDF أو DOCX",
+      image_too_large: "يجب ألا يتجاوز الملف 8 ميبيبايت",
       image_uncertain:
-        "لم يُؤكَّد التسليم — ربما أُرسلت الصورة بالفعل. أزل هذا الاختيار قبل اختيار صورة أخرى؛ لا تعِد الإرسال.",
+        "لم يُؤكَّد التسليم — ربما أُرسل الملف بالفعل. أزل هذا الاختيار قبل اختيار ملف آخر؛ لا تعِد الإرسال.",
+      document_only_hint: "سيُرسل المستند فقط",
+      document_and_text_hint: "يُرسل المستند والنص كرسالتين منفصلتين في ماسنجر",
+      document_sent_text_pending:
+        "أُرسل المستند. لم يُرسل النص — راجع المسودة وأرسل عند الجاهزية.",
+      document_uncertain:
+        "لم يُؤكَّد التسليم — ربما أُرسل المستند بالفعل. أزل هذا الاختيار قبل اختيار ملف آخر؛ لا تعِد الإرسال.",
       composer_placeholder: "اكتب رسالة…",
       empty_list: "لا توجد محادثات",
       empty_chat: "اختر محادثة",
@@ -402,7 +416,7 @@
       body.append(key, String(value));
     });
     if (fileField && file) {
-      body.append(fileField, file, file.name || "image");
+      body.append(fileField, file, file.name || fileField || "upload");
     }
     const response = await fetch(`/api/method/${method}`, {
       method: "POST",
@@ -425,18 +439,33 @@
     return crypto.randomUUID ? crypto.randomUUID() : `n-${Date.now()}`;
   }
 
-  const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
+  const MAX_COMPOSER_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+  const MAX_COMPOSER_IMAGE_BYTES = MAX_COMPOSER_ATTACHMENT_BYTES;
   const ALLOWED_IMAGE_MIME = {
     "image/jpeg": true,
     "image/jpg": true,
     "image/png": true,
     "image/gif": true,
   };
+  const DOCX_MIME =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  const ALLOWED_DOCUMENT_MIME = {
+    "application/pdf": true,
+  };
+  ALLOWED_DOCUMENT_MIME[DOCX_MIME] = true;
+  const COMPOSER_ACCEPT =
+    "image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif," +
+    "application/pdf,.pdf," +
+    DOCX_MIME +
+    ",.docx";
 
-  /** Per-conversation pending outbound image (File + stable nonce + object URL). */
+  /**
+   * Per-conversation pending outbound attachment (image or document).
+   * Kept as ``imageDrafts`` for existing wiring/tests; entries include ``kind``.
+   */
   const imageDrafts = Object.create(null);
   /**
-   * Text captured for a conversation when image Sent but follow-up text was deferred
+   * Text captured for a conversation when attachment Sent but follow-up text was deferred
    * (e.g. user switched threads). Restored on reopen; never auto-sent later.
    */
   const deferredTextByConversation = Object.create(null);
@@ -470,15 +499,75 @@
     return [file.name || "", file.size || 0, file.lastModified || 0, file.type || ""].join("|");
   }
 
-  function isAllowedComposerImage(file) {
-    if (!file) return false;
-    const mime = String(file.type || "")
+  function fileMime(file) {
+    return String((file && file.type) || "")
       .split(";", 1)[0]
       .trim()
       .toLowerCase();
+  }
+
+  function isAllowedComposerImage(file) {
+    if (!file) return false;
+    const mime = fileMime(file);
     if (ALLOWED_IMAGE_MIME[mime]) return true;
     const name = String(file.name || "").toLowerCase();
     return /\.(jpe?g|png|gif)$/.test(name);
+  }
+
+  function isAllowedComposerDocument(file) {
+    if (!file) return false;
+    const mime = fileMime(file);
+    if (ALLOWED_DOCUMENT_MIME[mime]) return true;
+    const name = String(file.name || "").toLowerCase();
+    return /\.(pdf|docx)$/.test(name);
+  }
+
+  function attachmentKindForFile(file) {
+    if (isAllowedComposerImage(file)) return "image";
+    if (isAllowedComposerDocument(file)) return "document";
+    return null;
+  }
+
+  function documentTypeLabel(file, mime) {
+    const name = String((file && file.name) || "").toLowerCase();
+    const type = String(mime || fileMime(file) || "").toLowerCase();
+    if (type === "application/pdf" || name.endsWith(".pdf")) return "PDF";
+    if (type === DOCX_MIME || name.endsWith(".docx")) return "DOCX";
+    return "File";
+  }
+
+  function formatAttachmentSize(bytes) {
+    const n = Number(bytes) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10 * 1024 ? 1 : 0) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  function attachmentSendSpec(kind) {
+    if (kind === "document") {
+      return {
+        kind: "document",
+        method: "meta_omnichannel.api.inbox.send_document_message",
+        field: "document",
+        defaultName: "document",
+        onlyHint: "document_only_hint",
+        andTextHint: "document_and_text_hint",
+        uncertain: "document_uncertain",
+        sentPending: "document_sent_text_pending",
+        sendLabel: "send_document",
+      };
+    }
+    return {
+      kind: "image",
+      method: "meta_omnichannel.api.inbox.send_image_message",
+      field: "image",
+      defaultName: "image",
+      onlyHint: "image_only_hint",
+      andTextHint: "image_and_text_hint",
+      uncertain: "image_uncertain",
+      sentPending: "image_sent_text_pending",
+      sendLabel: "send_image",
+    };
   }
 
   function revokeImagePreview(draft) {
@@ -515,17 +604,18 @@
     return nonce();
   }
 
-  function selectComposerImage(file) {
+  function selectComposerAttachment(file) {
     if (!state.selected || state.selected.provider !== "Facebook") return false;
     if (state.sending) return false;
     const conversationName = state.selected.name;
     if (!file) return false;
-    if (!isAllowedComposerImage(file)) {
+    const kind = attachmentKindForFile(file);
+    if (!kind) {
       state.error = t("image_type_rejected");
       render();
       return false;
     }
-    if ((file.size || 0) > MAX_COMPOSER_IMAGE_BYTES) {
+    if ((file.size || 0) > MAX_COMPOSER_ATTACHMENT_BYTES) {
       state.error = t("image_too_large");
       render();
       return false;
@@ -533,22 +623,30 @@
     const prev = imageDrafts[conversationName];
     const fileKey = imageFileKey(file);
     let nextNonce = nonce();
-    if (prev && prev.fileKey === fileKey && prev.nonce) nextNonce = prev.nonce;
+    if (prev && prev.fileKey === fileKey && prev.kind === kind && prev.nonce) {
+      nextNonce = prev.nonce;
+    }
     if (prev) revokeImagePreview(prev);
     let previewUrl = null;
-    try {
-      if (typeof URL !== "undefined" && URL.createObjectURL) {
-        previewUrl = URL.createObjectURL(file);
+    if (kind === "image") {
+      try {
+        if (typeof URL !== "undefined" && URL.createObjectURL) {
+          previewUrl = URL.createObjectURL(file);
+        }
+      } catch (_) {
+        previewUrl = null;
       }
-    } catch (_) {
-      previewUrl = null;
     }
+    const mime = file.type || "";
+    const spec = attachmentSendSpec(kind);
     imageDrafts[conversationName] = {
       conversation: conversationName,
+      kind: kind,
       file: file,
       fileKey: fileKey,
-      filename: file.name || "image",
-      mime: file.type || "",
+      filename: file.name || spec.defaultName,
+      mime: mime,
+      typeLabel: kind === "document" ? documentTypeLabel(file, mime) : "",
       size: file.size || 0,
       previewUrl: previewUrl,
       nonce: nextNonce,
@@ -557,6 +655,20 @@
     state.error = "";
     render();
     return true;
+  }
+
+  /** Image-only selector kept for tests; picker uses ``selectComposerAttachment``. */
+  function selectComposerImage(file) {
+    if (!file) return false;
+    if (!isAllowedComposerImage(file)) {
+      if (isAllowedComposerDocument(file)) {
+        return selectComposerAttachment(file);
+      }
+      state.error = t("image_type_rejected");
+      render();
+      return false;
+    }
+    return selectComposerAttachment(file);
   }
 
   function removeComposerImage() {
@@ -618,10 +730,21 @@
   }
 
   function composerCanSend() {
-    const imageDraft = currentImageDraft();
-    const hasImage = !!(imageDraft && imageDraft.file);
-    const imageBlocked = !!(hasImage && imageDraft.blockResend);
-    return composerCanCompose() && !imageBlocked && (hasImage || !!(state.draft || "").trim());
+    const attachmentDraft = currentImageDraft();
+    const hasAttachment = !!(attachmentDraft && attachmentDraft.file);
+    const attachmentBlocked = !!(hasAttachment && attachmentDraft.blockResend);
+    return (
+      composerCanCompose() &&
+      !attachmentBlocked &&
+      (hasAttachment || !!(state.draft || "").trim())
+    );
+  }
+
+  function composerSendButtonLabel(attachmentDraft) {
+    const hasAttachment = !!(attachmentDraft && attachmentDraft.file);
+    if (hasAttachment && (state.draft || "").trim()) return t("send");
+    if (hasAttachment) return t(attachmentSendSpec(attachmentDraft.kind).sendLabel);
+    return t("send");
   }
 
   /**
@@ -633,17 +756,13 @@
     if (!root) return;
     const canCompose = composerCanCompose();
     const canSend = composerCanSend();
-    const imageDraft = currentImageDraft();
-    const hasImage = !!(imageDraft && imageDraft.file);
+    const attachmentDraft = currentImageDraft();
+    const hasAttachment = !!(attachmentDraft && attachmentDraft.file);
+    const spec = hasAttachment ? attachmentSendSpec(attachmentDraft.kind) : null;
     const sendBtn = root.querySelector(".oc-composer-send");
     if (sendBtn) {
       sendBtn.disabled = !canSend;
-      sendBtn.textContent =
-        hasImage && (state.draft || "").trim()
-          ? t("send")
-          : hasImage
-            ? t("send_image")
-            : t("send");
+      sendBtn.textContent = composerSendButtonLabel(attachmentDraft);
     }
     const ta = root.querySelector(".oc-composer textarea");
     if (ta) ta.disabled = !canCompose;
@@ -654,10 +773,8 @@
     const removeBtn = root.querySelector(".oc-composer-remove");
     if (removeBtn) removeBtn.disabled = !!state.sending;
     const hint = root.querySelector(".oc-composer-hint");
-    if (hint && hasImage) {
-      hint.textContent = (state.draft || "").trim()
-        ? t("image_and_text_hint")
-        : t("image_only_hint");
+    if (hint && hasAttachment && spec) {
+      hint.textContent = (state.draft || "").trim() ? t(spec.andTextHint) : t(spec.onlyHint);
     }
   }
 
@@ -1148,9 +1265,9 @@
     // Synchronous in-flight guard — second click cannot start another request.
     if (state.sending) return;
     if (!state.selected || state.selected.provider !== "Facebook") return;
-    // Image selection uses image/combined send — never silently attach draft text here.
-    const pendingImage = currentImageDraft();
-    if (pendingImage && pendingImage.file) return;
+    // Attachment selection uses attachment/combined send — never silently attach draft text here.
+    const pendingAttachment = currentImageDraft();
+    if (pendingAttachment && pendingAttachment.file) return;
     const text = (state.draft || "").trim();
     if (!text) return;
 
@@ -1194,12 +1311,13 @@
     const conversationName = state.selected.name;
     const draft = imageDrafts[conversationName];
     if (!draft || !draft.file) return;
+    const spec = attachmentSendSpec(draft.kind || "image");
     if (draft.blockResend) {
-      state.error = t("image_uncertain");
+      state.error = t(spec.uncertain);
       render();
       return;
     }
-    // Combined path when composer has both image and text.
+    // Combined path when composer has both attachment and text.
     const companionText = (state.draft || "").trim();
     if (companionText) {
       return sendCombinedImageAndText();
@@ -1208,29 +1326,37 @@
     const clientNonce = draft.nonce || nonceForImage(conversationName, draft.file);
     draft.nonce = clientNonce;
     const fileKey = draft.fileKey;
+    const draftKind = draft.kind || "image";
     const myGen = ++sendGeneration;
     state.sending = true;
     state.error = "";
     render();
     try {
       const result = await callMultipart(
-        "meta_omnichannel.api.inbox.send_image_message",
+        spec.method,
         {
           conversation: conversationName,
           client_nonce: clientNonce,
         },
-        "image",
+        spec.field,
         draft.file
       );
-      // Stale: switched conversation or replaced the image selection mid-flight.
+      // Stale: switched conversation or replaced the selection mid-flight.
       if (myGen !== sendGeneration) return;
       if (!state.selected || state.selected.name !== conversationName) return;
       const still = imageDrafts[conversationName];
-      if (!still || still.fileKey !== fileKey || still.nonce !== clientNonce) return;
+      if (
+        !still ||
+        still.fileKey !== fileKey ||
+        still.nonce !== clientNonce ||
+        (still.kind || "image") !== draftKind
+      ) {
+        return;
+      }
 
       if (result && result.ok) {
         clearImageDraft(conversationName);
-        // Image-only: keep any unrelated text draft intact.
+        // Attachment-only: keep any unrelated text draft intact.
         state.error = "";
         await refreshAfterSend(conversationName);
         return;
@@ -1238,7 +1364,7 @@
 
       if (result && result.uncertain) {
         still.blockResend = true;
-        state.error = t("image_uncertain");
+        state.error = t(spec.uncertain);
       } else {
         state.error = (result && result.error) || "Send failed";
       }
@@ -1256,8 +1382,8 @@
   }
 
   /**
-   * Image then text as two Messenger messages. Holds state.sending across both.
-   * If the user leaves the conversation after image Sent, text is deferred (not auto-sent).
+   * Attachment then text as two Messenger messages. Holds state.sending across both.
+   * If the user leaves the conversation after attachment Sent, text is deferred (not auto-sent).
    */
   async function sendCombinedImageAndText() {
     if (state.sending) return;
@@ -1265,8 +1391,9 @@
     const conversationName = state.selected.name;
     const draft = imageDrafts[conversationName];
     if (!draft || !draft.file) return;
+    const spec = attachmentSendSpec(draft.kind || "image");
     if (draft.blockResend) {
-      state.error = t("image_uncertain");
+      state.error = t(spec.uncertain);
       render();
       return;
     }
@@ -1278,6 +1405,7 @@
     const imageNonce = draft.nonce || nonceForImage(conversationName, draft.file);
     draft.nonce = imageNonce;
     const fileKey = draft.fileKey;
+    const draftKind = draft.kind || "image";
     const imageFile = draft.file;
     const textNonce = nonceForDraft(conversationName, text);
     const myGen = ++sendGeneration;
@@ -1287,18 +1415,21 @@
 
     try {
       const imageResult = await callMultipart(
-        "meta_omnichannel.api.inbox.send_image_message",
+        spec.method,
         {
           conversation: conversationName,
           client_nonce: imageNonce,
         },
-        "image",
+        spec.field,
         imageFile
       );
 
       const imageRow = imageDrafts[conversationName];
       const imageStillOurs =
-        imageRow && imageRow.fileKey === fileKey && imageRow.nonce === imageNonce;
+        imageRow &&
+        imageRow.fileKey === fileKey &&
+        imageRow.nonce === imageNonce &&
+        (imageRow.kind || "image") === draftKind;
 
       if (!(imageResult && imageResult.ok)) {
         if (imageStillOurs) {
@@ -1309,7 +1440,7 @@
         // Keep text draft + text nonce; never start text after Failed/Unknown.
         if (myGen === sendGeneration && state.selected && state.selected.name === conversationName) {
           if (imageResult && imageResult.uncertain) {
-            state.error = t("image_uncertain");
+            state.error = t(spec.uncertain);
           } else {
             state.error = (imageResult && imageResult.error) || "Send failed";
           }
@@ -1318,7 +1449,7 @@
         return;
       }
 
-      // Confirmed image Sent — clear image for this conversation only.
+      // Confirmed attachment Sent — clear attachment for this conversation only.
       clearImageDraft(conversationName);
 
       // Defer text if the user switched away or edited before we start text.
@@ -1328,7 +1459,7 @@
       if (!stillOnConversation || myGen !== sendGeneration || !draftUnchanged) {
         stashDeferredText(conversationName, text, textNonce);
         if (stillOnConversation && myGen === sendGeneration) {
-          state.error = t("image_sent_text_pending");
+          state.error = t(spec.sentPending);
           render();
         }
         return;
@@ -1353,23 +1484,23 @@
       }
       if (outcome === "kept" || outcome === "edited") {
         if (outcome === "edited" && !state.error) {
-          state.error = t("image_sent_text_pending");
+          state.error = t(spec.sentPending);
         }
         render();
       }
-      // outcome === "switched": image already Sent; text handled without touching B.
+      // outcome === "switched": attachment already Sent; text handled without touching B.
     } catch (e) {
-      // Exception may be from image or text phase.
+      // Exception may be from attachment or text phase.
       const imageRow = imageDrafts[conversationName];
       if (imageRow && imageRow.fileKey === fileKey) {
-        // Image phase likely failed before clear.
+        // Attachment phase likely failed before clear.
         if (myGen === sendGeneration && state.selected && state.selected.name === conversationName) {
           state.error = e.message || String(e);
           render();
         }
         return;
       }
-      // Image was cleared — treat as text-phase failure; keep text + nonce.
+      // Attachment was cleared — treat as text-phase failure; keep text + nonce.
       stashDeferredText(conversationName, text, textNonce);
       if (myGen !== sendGeneration) return;
       if (!state.selected || state.selected.name !== conversationName) return;
@@ -1383,8 +1514,8 @@
 
   function sendComposer() {
     if (state.sending) return;
-    const img = currentImageDraft();
-    if (img && img.file) {
+    const attachment = currentImageDraft();
+    if (attachment && attachment.file) {
       const companionText = (state.draft || "").trim();
       if (companionText) return sendCombinedImageAndText();
       return sendImageMessage();
@@ -1553,34 +1684,60 @@
       const composer = el("div", { className: "oc-composer" });
       const canCompose = composerCanCompose();
       const canSend = composerCanSend();
-      const imageDraft = currentImageDraft();
-      const hasImage = !!(imageDraft && imageDraft.file);
+      const attachmentDraft = currentImageDraft();
+      const hasAttachment = !!(attachmentDraft && attachmentDraft.file);
+      const attachmentSpec = hasAttachment
+        ? attachmentSendSpec(attachmentDraft.kind || "image")
+        : null;
 
-      if (hasImage) {
-        const preview = el("div", { className: "oc-composer-preview" });
-        if (imageDraft.previewUrl) {
+      if (hasAttachment) {
+        const preview = el("div", {
+          className:
+            "oc-composer-preview" +
+            (attachmentDraft.kind === "document" ? " is-document" : ""),
+        });
+        if (attachmentDraft.kind === "document") {
+          preview.appendChild(
+            el("div", {
+              className: "oc-composer-doc-badge",
+              text: attachmentDraft.typeLabel || "File",
+            })
+          );
+        } else if (attachmentDraft.previewUrl) {
           preview.appendChild(
             el("img", {
               className: "oc-composer-thumb",
-              src: imageDraft.previewUrl,
-              alt: imageDraft.filename || "Image",
+              src: attachmentDraft.previewUrl,
+              alt: attachmentDraft.filename || "Image",
             })
           );
         }
-        preview.appendChild(
-          el("div", { className: "oc-composer-preview-meta" }, [
+        const metaKids = [
+          el("div", {
+            className: "oc-composer-filename",
+            text: attachmentDraft.filename || attachmentSpec.defaultName,
+          }),
+        ];
+        if (attachmentDraft.kind === "document") {
+          metaKids.push(
             el("div", {
-              className: "oc-composer-filename",
-              text: imageDraft.filename || "image",
-            }),
-            el("div", {
-              className: "oc-composer-hint",
-              text: (state.draft || "").trim()
-                ? t("image_and_text_hint")
-                : t("image_only_hint"),
-            }),
-          ])
+              className: "oc-composer-filesize",
+              text:
+                (attachmentDraft.typeLabel || "File") +
+                " · " +
+                formatAttachmentSize(attachmentDraft.size),
+            })
+          );
+        }
+        metaKids.push(
+          el("div", {
+            className: "oc-composer-hint",
+            text: (state.draft || "").trim()
+              ? t(attachmentSpec.andTextHint)
+              : t(attachmentSpec.onlyHint),
+          })
         );
+        preview.appendChild(el("div", { className: "oc-composer-preview-meta" }, metaKids));
         preview.appendChild(
           el("button", {
             className: "oc-btn secondary oc-composer-remove",
@@ -1602,13 +1759,13 @@
         fileInput = el("input", {
           className: "oc-composer-file",
           type: "file",
-          accept: "image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif",
+          accept: COMPOSER_ACCEPT,
           disabled: !canCompose,
           onchange: (e) => {
             const input = e && e.target;
             const file =
               input && input.files && input.files.length ? input.files[0] : null;
-            if (file) selectComposerImage(file);
+            if (file) selectComposerAttachment(file);
             if (input) input.value = "";
           },
         });
@@ -1642,12 +1799,7 @@
         el("button", {
           className: "oc-btn oc-composer-send",
           type: "button",
-          text:
-            hasImage && (state.draft || "").trim()
-              ? t("send")
-              : hasImage
-                ? t("send_image")
-                : t("send"),
+          text: composerSendButtonLabel(attachmentDraft),
           disabled: !canSend,
           onclick: sendComposer,
         })
@@ -1923,6 +2075,7 @@
     sendCombinedImageAndText: sendCombinedImageAndText,
     sendComposer: sendComposer,
     selectComposerImage: selectComposerImage,
+    selectComposerAttachment: selectComposerAttachment,
     removeComposerImage: removeComposerImage,
     getDeferredText: function (conversationName) {
       const pending = deferredTextByConversation[conversationName || ""];
@@ -1949,8 +2102,10 @@
       if (!draft) return null;
       return {
         conversation: draft.conversation,
+        kind: draft.kind || "image",
         filename: draft.filename,
         mime: draft.mime,
+        typeLabel: draft.typeLabel || "",
         size: draft.size,
         fileKey: draft.fileKey,
         nonce: draft.nonce,

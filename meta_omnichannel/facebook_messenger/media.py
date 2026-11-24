@@ -49,8 +49,16 @@ from frappe.utils.file_manager import get_file_path, save_file
 from meta_omnichannel.facebook_messenger.adapter import (
 	AttachmentPayload,
 	FacebookConnectorAdapter,
+	MAX_OUTBOUND_DOCUMENT_BYTES,
 )
 from meta_omnichannel.meta_connectors.errors import ConnectorError
+
+_OUTBOUND_DOCUMENT_MIME_TYPES = frozenset(
+	{
+		"application/pdf",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	}
+)
 
 PROVIDER = "Facebook"
 MESSAGE_DOCTYPE = "Omnichannel Message"
@@ -774,14 +782,23 @@ def persist_message_attachment(
 		)
 
 
-def attach_outbound_image_file(
+def _sanitize_outbound_file_basename(filename: str | None) -> str:
+	"""Strip path separators from a caller-provided upload name (never a URL)."""
+	raw = (filename or "").strip().replace("\\", "_").replace("/", "_")
+	return raw[:140]
+
+
+def _attach_outbound_bytes_file(
 	message_name: str,
 	content: bytes,
 	content_type: str,
 	*,
 	attachment_index: int = 0,
+	filename: str | None = None,
+	content_required_message: str,
+	mime_required_message: str,
 ) -> dict[str, Any]:
-	"""Persist outbound image bytes as a private File + Ready child row.
+	"""Persist outbound bytes as a private File + Ready child row.
 
 	Does not call the Connector or commit/rollback. Reuses an existing Ready File
 	with the same content hash. Never returns ``file_url``.
@@ -791,12 +808,12 @@ def attach_outbound_image_file(
 	if not message_name:
 		frappe.throw(_("Omnichannel Message {0} not found").format(message_name), frappe.ValidationError)
 	if not isinstance(content, (bytes, bytearray)) or not bytes(content):
-		frappe.throw(_("Outbound image content is required"), frappe.ValidationError)
+		frappe.throw(content_required_message, frappe.ValidationError)
 
 	payload = bytes(content)
 	mime = (content_type or "").split(";", 1)[0].strip().lower()
 	if not mime:
-		frappe.throw(_("Outbound image MIME type is required"), frappe.ValidationError)
+		frappe.throw(mime_required_message, frappe.ValidationError)
 
 	_load_message(message_name)
 	content_hash = _sha256_hex(payload)
@@ -822,7 +839,9 @@ def attach_outbound_image_file(
 	try:
 		file_name = existing_file
 		if not file_name:
-			fname = _safe_filename(message_name, index, mime)
+			fname = _sanitize_outbound_file_basename(filename) or _safe_filename(
+				message_name, index, mime
+			)
 			file_doc = save_file(
 				fname,
 				payload,
@@ -861,3 +880,58 @@ def attach_outbound_image_file(
 		_mark_child_failed(child_name, _sanitize_error(exc))
 		_delete_new_file_best_effort(created_file_name)
 		raise
+
+
+def attach_outbound_image_file(
+	message_name: str,
+	content: bytes,
+	content_type: str,
+	*,
+	attachment_index: int = 0,
+) -> dict[str, Any]:
+	"""Persist outbound image bytes as a private File + Ready child row.
+
+	Does not call the Connector or commit/rollback. Reuses an existing Ready File
+	with the same content hash. Never returns ``file_url``.
+	"""
+	return _attach_outbound_bytes_file(
+		message_name,
+		content,
+		content_type,
+		attachment_index=attachment_index,
+		content_required_message=_("Outbound image content is required"),
+		mime_required_message=_("Outbound image MIME type is required"),
+	)
+
+
+def attach_outbound_document_file(
+	message_name: str,
+	content: bytes,
+	content_type: str,
+	*,
+	filename: str | None = None,
+	attachment_index: int = 0,
+) -> dict[str, Any]:
+	"""Persist outbound PDF/DOCX bytes as a private File + Ready child row.
+
+	Does not call the Connector or commit/rollback. Reuses an existing Ready File
+	with the same content hash. Never returns ``file_url``.
+	"""
+	mime = (content_type or "").split(";", 1)[0].strip().lower()
+	if mime not in _OUTBOUND_DOCUMENT_MIME_TYPES:
+		frappe.throw(
+			_("Outbound document must be a PDF or DOCX file"),
+			frappe.ValidationError,
+		)
+	if isinstance(content, (bytes, bytearray)) and len(bytes(content)) > MAX_OUTBOUND_DOCUMENT_BYTES:
+		frappe.throw(_("Document exceeds 8 MiB limit"), frappe.ValidationError)
+
+	return _attach_outbound_bytes_file(
+		message_name,
+		content,
+		mime,
+		attachment_index=attachment_index,
+		filename=filename,
+		content_required_message=_("Outbound document content is required"),
+		mime_required_message=_("Outbound document MIME type is required"),
+	)

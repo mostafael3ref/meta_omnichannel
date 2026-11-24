@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
 from typing import Any, NamedTuple
 from urllib.parse import quote
 
@@ -18,12 +20,22 @@ CONVERSATIONS_PATH = "/api/facebook/conversations"
 MESSAGES_PATH = "/api/facebook/messages"
 SEND_PATH = "/api/facebook/messages/send"
 SEND_IMAGE_PATH = "/api/facebook/messages/send-image"
+SEND_DOCUMENT_PATH = "/api/facebook/messages/send-document"
 # Meta Messenger attachment upload limit; refuse larger Connector payloads (inbound GET).
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 # Confirmed outbound image send contract (Connector → Meta Attachment Upload API).
 MAX_OUTBOUND_IMAGE_BYTES = 8 * 1024 * 1024
+# Confirmed outbound document send contract (Connector send-document).
+MAX_OUTBOUND_DOCUMENT_BYTES = 8 * 1024 * 1024
 _OUTBOUND_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
 _OUTBOUND_IMAGE_TYPE_ALIASES = {"image/jpg": "image/jpeg"}
+_PDF_MIME = "application/pdf"
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_OUTBOUND_DOCUMENT_TYPES = frozenset({_PDF_MIME, _DOCX_MIME})
+_OUTBOUND_DOCUMENT_DEFAULT_NAME = {
+	_PDF_MIME: "document.pdf",
+	_DOCX_MIME: "document.docx",
+}
 
 
 class AttachmentPayload(NamedTuple):
@@ -108,6 +120,82 @@ def _validate_outbound_image(
 	# Path separators must not leak into the multipart filename.
 	name = name.replace("\\", "_").replace("/", "_")
 	return payload, name, ct
+
+
+def _normalize_outbound_document_content_type(content_type: str) -> str:
+	return (content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _looks_like_pdf(payload: bytes) -> bool:
+	"""PDF files must start with the ``%PDF-`` signature."""
+	return payload.startswith(b"%PDF-")
+
+
+def _looks_like_docx(payload: bytes) -> bool:
+	"""DOCX is OOXML: ZIP container with ``[Content_Types].xml`` and a Word part."""
+	if len(payload) < 4 or not payload.startswith(b"PK\x03\x04"):
+		return False
+	try:
+		with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+			names = set(zf.namelist())
+			if "[Content_Types].xml" not in names:
+				return False
+			if "word/document.xml" in names:
+				return True
+			try:
+				content_types = zf.read("[Content_Types].xml").decode("utf-8", errors="ignore")
+			except Exception:
+				return False
+			return "wordprocessingml" in content_types.lower()
+	except zipfile.BadZipFile:
+		return False
+
+
+def _detect_outbound_document_mime(payload: bytes) -> str | None:
+	"""Sniff PDF signature or DOCX OOXML structure (ignore declared extension)."""
+	if not payload:
+		return None
+	if _looks_like_pdf(payload):
+		return _PDF_MIME
+	if _looks_like_docx(payload):
+		return _DOCX_MIME
+	return None
+
+
+def _validate_outbound_document(
+	*,
+	document_bytes: bytes,
+	filename: str,
+	content_type: str,
+) -> tuple[bytes, str, str]:
+	"""Return ``(bytes, filename, content_type)`` or raise before any Connector call."""
+	if not isinstance(document_bytes, (bytes, bytearray)):
+		raise ConnectorError("send_document: document_bytes must be bytes")
+	payload = bytes(document_bytes)
+	if not payload:
+		raise ConnectorError("send_document: document_bytes must not be empty")
+	if len(payload) > MAX_OUTBOUND_DOCUMENT_BYTES:
+		raise ConnectorError("send_document: document exceeds 8 MiB limit")
+
+	declared = _normalize_outbound_document_content_type(content_type)
+	if declared not in _OUTBOUND_DOCUMENT_TYPES:
+		raise ConnectorError(
+			"send_document: content_type must be application/pdf or "
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		)
+
+	detected = _detect_outbound_document_mime(payload)
+	if not detected:
+		raise ConnectorError("send_document: document must be a valid PDF or DOCX file")
+	if declared != detected:
+		raise ConnectorError(
+			"send_document: document content does not match the declared MIME type"
+		)
+
+	name = (filename or "").strip() or _OUTBOUND_DOCUMENT_DEFAULT_NAME[detected]
+	# Path separators must not leak into the multipart filename.
+	name = name.replace("\\", "_").replace("/", "_")
+	return payload, name, detected
 
 
 class FacebookConnectorAdapter:
@@ -281,4 +369,50 @@ class FacebookConnectorAdapter:
 		data = response.json() if response.content else {}
 		if data and not isinstance(data, dict):
 			raise ConnectorError("send_image: response must be a JSON object")
+		return data or {"status": "sent"}
+
+	def send_document(
+		self,
+		*,
+		page_id: str,
+		recipient_id: str,
+		idempotency_key: str,
+		document_bytes: bytes,
+		filename: str,
+		content_type: str,
+	) -> dict[str, Any]:
+		"""POST multipart PDF/DOCX bytes to the Connector (never a File URL).
+
+		Does not retry. Caller maps timeouts / HTTP 5xx to Unknown delivery.
+		"""
+		page_id = (page_id or "").strip()
+		recipient_id = (recipient_id or "").strip()
+		idempotency_key = (idempotency_key or "").strip()
+		if not page_id or not recipient_id or not idempotency_key:
+			raise ConnectorError(
+				"send_document: page_id, recipient_id, and idempotency_key are required"
+			)
+
+		payload, safe_name, mime = _validate_outbound_document(
+			document_bytes=document_bytes,
+			filename=filename,
+			content_type=content_type,
+		)
+
+		response = self.client.request(
+			"POST",
+			SEND_DOCUMENT_PATH,
+			data={
+				"page_id": page_id,
+				"recipient_id": recipient_id,
+				"idempotency_key": idempotency_key,
+			},
+			files={
+				"document": (safe_name, payload, mime),
+			},
+		)
+		_raise_for_status(response.status_code, context="send_document")
+		data = response.json() if response.content else {}
+		if data and not isinstance(data, dict):
+			raise ConnectorError("send_document: response must be a JSON object")
 		return data or {"status": "sent"}

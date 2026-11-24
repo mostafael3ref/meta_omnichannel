@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import unittest
+import zipfile
 from unittest.mock import MagicMock
 from urllib.parse import quote
 
 from meta_omnichannel.facebook_messenger.adapter import (
 	MAX_ATTACHMENT_BYTES,
+	MAX_OUTBOUND_DOCUMENT_BYTES,
 	MAX_OUTBOUND_IMAGE_BYTES,
+	SEND_DOCUMENT_PATH,
 	SEND_IMAGE_PATH,
 	FacebookConnectorAdapter,
+	_DOCX_MIME,
+	_PDF_MIME,
 )
 from meta_omnichannel.meta_connectors.errors import (
 	ConnectorAuthError,
@@ -20,7 +27,51 @@ from meta_omnichannel.meta_connectors.errors import (
 	ConnectorServerError,
 	ConnectorUnreachableError,
 )
-from meta_omnichannel.utils.idempotency import build_outbound_idempotency_key
+from meta_omnichannel.utils.idempotency import (
+	build_outbound_document_idempotency_key,
+	build_outbound_idempotency_key,
+	build_outbound_image_idempotency_key,
+	outbound_document_nonce_key_prefix,
+)
+
+
+def _minimal_pdf() -> bytes:
+	return (
+		b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+		b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"
+		b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
+	)
+
+
+def _minimal_docx() -> bytes:
+	buf = io.BytesIO()
+	with zipfile.ZipFile(buf, "w") as zf:
+		zf.writestr(
+			"[Content_Types].xml",
+			'<?xml version="1.0" encoding="UTF-8"?>'
+			'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+			'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+			'<Default Extension="xml" ContentType="application/xml"/>'
+			'<Override PartName="/word/document.xml" '
+			'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+			"</Types>",
+		)
+		zf.writestr(
+			"_rels/.rels",
+			'<?xml version="1.0" encoding="UTF-8"?>'
+			'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+			'<Relationship Id="rId1" '
+			'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+			'Target="word/document.xml"/>'
+			"</Relationships>",
+		)
+		zf.writestr(
+			"word/document.xml",
+			'<?xml version="1.0" encoding="UTF-8"?>'
+			'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+			"<w:body><w:p/></w:body></w:document>",
+		)
+	return buf.getvalue()
 
 
 class TestIdempotency(unittest.TestCase):
@@ -443,6 +494,269 @@ class TestSendImage(unittest.TestCase):
 		)
 		self.assertTrue(out["duplicate"])
 		self.assertEqual(out["message_id"], "m_dup")
+
+
+class TestOutboundDocumentIdempotencyHelpers(unittest.TestCase):
+	def test_stable_document_key_is_nonce_scoped(self):
+		sha = hashlib.sha256(_minimal_pdf()).hexdigest()
+		a = build_outbound_document_idempotency_key(
+			conversation_name="CONV-1", client_nonce="n1", content_sha256=sha
+		)
+		b = build_outbound_document_idempotency_key(
+			conversation_name="CONV-1", client_nonce="n1", content_sha256=sha
+		)
+		self.assertEqual(a, b)
+		self.assertTrue(a.startswith("oc-doc:"))
+		self.assertEqual(
+			a,
+			outbound_document_nonce_key_prefix(
+				conversation_name="CONV-1", client_nonce="n1"
+			),
+		)
+
+	def test_same_nonce_same_key_regardless_of_document_hash(self):
+		sha1 = hashlib.sha256(_minimal_pdf()).hexdigest()
+		sha2 = hashlib.sha256(_minimal_docx()).hexdigest()
+		a = build_outbound_document_idempotency_key(
+			conversation_name="CONV-1", client_nonce="n1", content_sha256=sha1
+		)
+		b = build_outbound_document_idempotency_key(
+			conversation_name="CONV-1", client_nonce="n1", content_sha256=sha2
+		)
+		self.assertEqual(a, b)
+		self.assertNotEqual(sha1, sha2)
+
+	def test_document_and_image_namespaces_are_separate(self):
+		doc = build_outbound_document_idempotency_key(
+			conversation_name="CONV-1", client_nonce="same-nonce"
+		)
+		img = build_outbound_image_idempotency_key(
+			conversation_name="CONV-1", client_nonce="same-nonce"
+		)
+		self.assertTrue(doc.startswith("oc-doc:"))
+		self.assertTrue(img.startswith("oc-img:"))
+		self.assertNotEqual(doc, img)
+		self.assertFalse(doc.startswith("oc-img:"))
+		self.assertFalse(img.startswith("oc-doc:"))
+
+	def test_image_key_algorithm_unchanged(self):
+		a = build_outbound_image_idempotency_key(
+			conversation_name="CONV-1", client_nonce="n1"
+		)
+		self.assertEqual(a, "oc-img:CONV-1:n1")
+
+
+class TestSendDocument(unittest.TestCase):
+	def setUp(self):
+		self.client = MagicMock()
+		self.adapter = FacebookConnectorAdapter(client=self.client)
+		self.pdf = _minimal_pdf()
+		self.docx = _minimal_docx()
+
+	def _resp(self, status, payload):
+		r = MagicMock()
+		r.status_code = status
+		r.content = b"{}"
+		r.json.return_value = payload
+		return r
+
+	def test_send_pdf_multipart_contract(self):
+		self.client.request.return_value = self._resp(
+			200,
+			{"status": "sent", "page_id": "P1", "message_id": "m_pdf", "duplicate": False},
+		)
+		out = self.adapter.send_document(
+			page_id="P1",
+			recipient_id="S1",
+			idempotency_key="idem-doc-1",
+			document_bytes=self.pdf,
+			filename="report.pdf",
+			content_type=_PDF_MIME,
+		)
+		self.assertEqual(out["status"], "sent")
+		self.assertEqual(out["message_id"], "m_pdf")
+		args, kwargs = self.client.request.call_args
+		self.assertEqual(args[0], "POST")
+		self.assertEqual(args[1], SEND_DOCUMENT_PATH)
+		self.assertEqual(SEND_DOCUMENT_PATH, "/api/facebook/messages/send-document")
+		self.assertIsNone(kwargs.get("json_body"))
+		self.assertEqual(
+			kwargs["data"],
+			{"page_id": "P1", "recipient_id": "S1", "idempotency_key": "idem-doc-1"},
+		)
+		name, body, mime = kwargs["files"]["document"]
+		self.assertEqual(name, "report.pdf")
+		self.assertEqual(body, self.pdf)
+		self.assertEqual(mime, _PDF_MIME)
+		self.assertEqual(self.client.request.call_count, 1)
+
+	def test_send_docx_multipart_contract(self):
+		self.client.request.return_value = self._resp(
+			200, {"status": "sent", "message_id": "m_docx", "duplicate": False}
+		)
+		out = self.adapter.send_document(
+			page_id="P1",
+			recipient_id="S1",
+			idempotency_key="idem-doc-2",
+			document_bytes=self.docx,
+			filename="notes.docx",
+			content_type=_DOCX_MIME,
+		)
+		self.assertEqual(out["message_id"], "m_docx")
+		name, body, mime = self.client.request.call_args.kwargs["files"]["document"]
+		self.assertEqual(name, "notes.docx")
+		self.assertEqual(body, self.docx)
+		self.assertEqual(mime, _DOCX_MIME)
+
+	def test_sanitizes_path_separators_in_filename(self):
+		self.client.request.return_value = self._resp(
+			200, {"status": "sent", "message_id": "m", "duplicate": False}
+		)
+		self.adapter.send_document(
+			page_id="P1",
+			recipient_id="S1",
+			idempotency_key="k",
+			document_bytes=self.pdf,
+			filename=r"..\..\evil/report.pdf",
+			content_type=_PDF_MIME,
+		)
+		name, _body, _mime = self.client.request.call_args.kwargs["files"]["document"]
+		self.assertEqual(name, ".._.._evil_report.pdf")
+		self.assertNotIn("/", name)
+		self.assertNotIn("\\", name)
+
+	def test_rejects_empty_document_before_request(self):
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=b"",
+				filename="empty.pdf",
+				content_type=_PDF_MIME,
+			)
+		self.assertIn("empty", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_oversized_document_before_request(self):
+		huge = b"%PDF-" + b"\x00" * MAX_OUTBOUND_DOCUMENT_BYTES
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=huge,
+				filename="big.pdf",
+				content_type=_PDF_MIME,
+			)
+		self.assertIn("8 mib", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_unsupported_mime_before_request(self):
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=self.pdf,
+				filename="x.txt",
+				content_type="text/plain",
+			)
+		self.assertIn("content_type", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_mismatched_pdf_declaration(self):
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=self.docx,
+				filename="lie.pdf",
+				content_type=_PDF_MIME,
+			)
+		self.assertIn("does not match", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_mismatched_docx_declaration(self):
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=self.pdf,
+				filename="lie.docx",
+				content_type=_DOCX_MIME,
+			)
+		self.assertIn("does not match", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_random_zip_as_docx(self):
+		buf = io.BytesIO()
+		with zipfile.ZipFile(buf, "w") as zf:
+			zf.writestr("readme.txt", "not a word document")
+		with self.assertRaises(ConnectorError) as ctx:
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=buf.getvalue(),
+				filename="fake.docx",
+				content_type=_DOCX_MIME,
+			)
+		self.assertIn("valid pdf or docx", str(ctx.exception).lower())
+		self.client.request.assert_not_called()
+
+	def test_rejects_non_pdf_signature(self):
+		with self.assertRaises(ConnectorError):
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=b"not-a-pdf",
+				filename="x.pdf",
+				content_type=_PDF_MIME,
+			)
+		self.client.request.assert_not_called()
+
+	def test_http_502_is_server_error_for_unknown_mapping(self):
+		self.client.request.return_value = self._resp(502, {})
+		with self.assertRaises(ConnectorServerError):
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=self.pdf,
+				filename="a.pdf",
+				content_type=_PDF_MIME,
+			)
+
+	def test_timeout_unreachable_no_retry(self):
+		self.client.request.side_effect = ConnectorUnreachableError(
+			"Connector request timed out"
+		)
+		with self.assertRaises(ConnectorUnreachableError):
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=self.pdf,
+				filename="a.pdf",
+				content_type=_PDF_MIME,
+			)
+		self.assertEqual(self.client.request.call_count, 1)
+
+	def test_http_403_is_forbidden(self):
+		self.client.request.return_value = self._resp(403, {})
+		with self.assertRaises(ConnectorForbiddenError):
+			self.adapter.send_document(
+				page_id="P1",
+				recipient_id="S1",
+				idempotency_key="k",
+				document_bytes=self.pdf,
+				filename="a.pdf",
+				content_type=_PDF_MIME,
+			)
 
 
 if __name__ == "__main__":

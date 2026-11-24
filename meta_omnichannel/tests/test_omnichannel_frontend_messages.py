@@ -813,33 +813,42 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		js = PLAIN_JS.read_text(encoding="utf-8")
 		self.assertIn("function callMultipart", js)
 		self.assertIn("meta_omnichannel.api.inbox.send_image_message", js)
-		self.assertIn('body.append(fileField, file, file.name || "image")', js)
+		self.assertIn("meta_omnichannel.api.inbox.send_document_message", js)
+		self.assertIn('body.append(fileField, file, file.name || fileField || "upload")', js)
 		# Never force multipart Content-Type (browser sets boundary).
 		multipart = js[js.index("async function callMultipart") : js.index("function nonce()")]
 		self.assertNotIn("Content-Type", multipart)
 		self.assertIn("X-Frappe-CSRF-Token", multipart)
 		self.assertIn("credentials: \"same-origin\"", multipart)
 		self.assertIn("function selectComposerImage", js)
+		self.assertIn("function selectComposerAttachment", js)
 		self.assertIn("function sendImageMessage", js)
 		self.assertIn("function sendComposer", js)
 		self.assertIn("imageDrafts", js)
 		self.assertIn("MAX_COMPOSER_IMAGE_BYTES", js)
+		self.assertIn("MAX_COMPOSER_ATTACHMENT_BYTES", js)
 		self.assertIn("blockResend", js)
 		self.assertIn("image_only_hint", js)
 		self.assertIn("image_and_text_hint", js)
 		self.assertIn("image_sent_text_pending", js)
+		self.assertIn("document_only_hint", js)
+		self.assertIn("document_and_text_hint", js)
 		self.assertIn("function sendCombinedImageAndText", js)
 		self.assertIn("function syncComposerControls", js)
 		self.assertIn("oc-composer-send", js)
 		self.assertIn("oc-composer-attach", js)
-		self.assertIn("accept: \"image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif\"", js)
+		self.assertIn("COMPOSER_ACCEPT", js)
+		self.assertIn(".pdf", js)
+		self.assertIn(".docx", js)
+		self.assertIn('field: "document"', js)
 		# Captions unsupported — multipart image request must not append draft text.
 		combined = js[
 			js.index("async function sendCombinedImageAndText") : js.index("function sendComposer")
 		]
 		self.assertIn("callMultipart", combined)
-		self.assertNotIn("text: text", combined.split("send_image_message")[0])
-		self.assertIn('"image"', combined)
+		# Caption field must not ride on the multipart call (only later send_message).
+		self.assertNotIn("text: text", combined.split("send_message")[0])
+		self.assertIn("spec.field", combined)
 		self.assertIn("client_nonce: imageNonce", combined)
 		# Text follows only after confirmed image ok; never as image caption field.
 		self.assertIn("send_message", combined)
@@ -849,6 +858,8 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		)
 		self.assertIn(".oc-composer-preview", css)
 		self.assertIn(".oc-composer-row.has-attach", css)
+		self.assertIn(".oc-composer-doc-badge", css)
+		self.assertIn(".oc-composer-filesize", css)
 
 
 def _find_node_executable() -> Optional[str]:
@@ -1005,6 +1016,22 @@ function makeImageFile(overrides) {
   };
 }
 
+function makeDocumentFile(overrides) {
+  const o = overrides || {};
+  const name = o.name || "quote.pdf";
+  const isDocx = /\.docx$/i.test(name) || o.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  return {
+    name: name,
+    size: o.size != null ? o.size : 128,
+    type:
+      o.type ||
+      (isDocx
+        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        : "application/pdf"),
+    lastModified: o.lastModified || 1,
+  };
+}
+
 function matchSel(node, sel) {
   if (!sel) return false;
   if (sel.startsWith(".")) {
@@ -1056,7 +1083,7 @@ const root = createEl("div");
 root.id = "omnichannel-app";
 root.querySelector = (sel) => queryOne(root, sel);
 
-const gate = { list: [], messages: [], panel: [], send: [], sendImage: [] };
+const gate = { list: [], messages: [], panel: [], send: [], sendImage: [], sendDocument: [] };
 let nonceSeq = 0;
 function defer() {
   let settled = false;
@@ -1215,6 +1242,28 @@ const sandbox = {
       const payload = await entry.d;
       return { ok: true, json: async () => ({ message: payload }) };
     }
+    if (path.indexOf("send_document_message") !== -1) {
+      const body = opts && opts.body;
+      assert.ok(body && typeof body.get === "function", "FormData body required");
+      assert.strictEqual(
+        headers["Content-Type"],
+        undefined,
+        "must not set multipart Content-Type manually"
+      );
+      assert.ok(headers["X-Frappe-CSRF-Token"], "CSRF required");
+      const entry = {
+        conversation: body.get("conversation") || "",
+        client_nonce: body.get("client_nonce") || "",
+        document: body.get("document"),
+        text: body.get("text"),
+        headers: headers,
+        credentials: opts.credentials,
+        d: defer(),
+      };
+      gate.sendDocument.push(entry);
+      const payload = await entry.d;
+      return { ok: true, json: async () => ({ message: payload }) };
+    }
     const params = new URLSearchParams(opts.body);
     if (path.indexOf("list_conversations") !== -1) {
       const entry = { search: params.get("search") || "", d: defer() };
@@ -1292,6 +1341,7 @@ assert.strictEqual(typeof api.setDraft, "function");
 assert.strictEqual(typeof api.sendMessage, "function");
 assert.strictEqual(typeof api.sendImageMessage, "function");
 assert.strictEqual(typeof api.selectComposerImage, "function");
+assert.strictEqual(typeof api.selectComposerAttachment, "function");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function waitUntil(fn, label, tries = 100) {
@@ -2400,6 +2450,353 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "document_select_preview_and_reject") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(
+      api.selectComposerAttachment(
+        makeDocumentFile({ name: "quote.pdf", type: "application/pdf", size: 2048 })
+      )
+    );
+    const draft = api.getImageDraft();
+    assert.ok(draft && draft.hasFile);
+    assert.strictEqual(draft.kind, "document");
+    assert.strictEqual(draft.filename, "quote.pdf");
+    assert.strictEqual(draft.typeLabel, "PDF");
+    assert.ok(!draft.previewUrl, "documents use badge preview, not object URL");
+    const preview = root.querySelector(".oc-composer-preview");
+    assert.ok(preview);
+    assert.ok(
+      String(preview.className || "").split(/\s+/).includes("is-document"),
+      "document preview marker"
+    );
+    assert.ok(root.querySelector(".oc-composer-doc-badge"));
+    assert.ok(root.querySelector(".oc-composer-filesize"));
+    assert.ok(
+      api.selectComposerAttachment(
+        makeDocumentFile({
+          name: "spec.docx",
+          type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size: 4096,
+        })
+      )
+    );
+    assert.strictEqual(api.getImageDraft().typeLabel, "DOCX");
+    assert.strictEqual(
+      api.selectComposerAttachment(makeDocumentFile({ name: "x.txt", type: "text/plain", size: 10 })),
+      false
+    );
+    assert.ok(String(api.getState().error || "").length > 0);
+    assert.strictEqual(
+      api.selectComposerAttachment(
+        makeDocumentFile({ name: "big.pdf", type: "application/pdf", size: 8 * 1024 * 1024 + 1 })
+      ),
+      false
+    );
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("8") >= 0);
+    console.log("OK document_select_preview_and_reject");
+    return;
+  }
+
+  if (scenario === "document_send_multipart_csrf_and_dedupe") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("");
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "a.pdf", size: 200 })));
+    const nonce1 = api.getImageAttemptNonce();
+    const p1 = api.sendComposer();
+    const p2 = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "document send");
+    assert.strictEqual(gate.sendDocument.length, 1, "duplicate click blocked");
+    assert.strictEqual(gate.sendImage.length, 0, "image API unused");
+    assert.strictEqual(gate.send.length, 0, "text send unused");
+    assert.strictEqual(gate.sendDocument[0].client_nonce, nonce1);
+    assert.strictEqual(gate.sendDocument[0].conversation, "CONV-A");
+    assert.ok(gate.sendDocument[0].document);
+    assert.strictEqual(gate.sendDocument[0].text, null, "no caption field");
+    assert.strictEqual(gate.sendDocument[0].credentials, "same-origin");
+    assert.ok(gate.sendDocument[0].headers["X-Frappe-CSRF-Token"]);
+    const settle = settlePostSendRefresh();
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-DOC",
+      deduplicated: false,
+    });
+    await p1;
+    await p2;
+    await settle;
+    assert.strictEqual(api.getState().hasImageDraft, false, "cleared on success");
+    assert.strictEqual(api.getImageAttemptNonce(), null);
+    console.log("OK document_send_multipart_csrf_and_dedupe");
+    return;
+  }
+
+  if (scenario === "document_failed_keeps_selection") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "fail.pdf", size: 40 })));
+    const nonce1 = api.getImageAttemptNonce();
+    const p = api.sendImageMessage();
+    await waitUntil(() => gate.sendDocument.length >= 1, "fail doc");
+    gate.sendDocument[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle fail");
+    assert.strictEqual(api.getState().hasImageDraft, true);
+    assert.strictEqual(api.getImageAttemptNonce(), nonce1);
+    assert.strictEqual(api.getImageDraft().kind, "document");
+    assert.ok(api.getState().error);
+    const p2 = api.sendImageMessage();
+    await waitUntil(() => gate.sendDocument.length >= 2, "retry");
+    assert.strictEqual(gate.sendDocument[1].client_nonce, nonce1);
+    gate.sendDocument[1].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: true,
+    });
+    await p2;
+    await waitUntil(() => api.getState().sending === false, "idle retry");
+    console.log("OK document_failed_keeps_selection");
+    return;
+  }
+
+  if (scenario === "document_uncertain_blocks_resend") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "maybe.pdf", size: 40 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "uncertain doc");
+    gate.sendDocument[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle uncertain");
+    assert.strictEqual(api.getState().hasImageDraft, true);
+    assert.ok(api.getImageDraft().blockResend);
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("unconfirmed") >= 0);
+    await api.sendComposer();
+    assert.strictEqual(gate.sendDocument.length, 1, "no one-click resend after Unknown");
+    console.log("OK document_uncertain_blocks_resend");
+    return;
+  }
+
+  if (scenario === "combined_document_then_text_success") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("hello with pdf");
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "c.pdf", size: 20 })));
+    const docNonce = api.getImageAttemptNonce();
+    assert.ok(docNonce);
+    const p1 = api.sendComposer();
+    const p2 = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "combined document");
+    assert.strictEqual(gate.sendDocument.length, 1);
+    assert.strictEqual(gate.sendImage.length, 0);
+    assert.strictEqual(gate.send.length, 0, "no text before document Sent");
+    assert.strictEqual(gate.sendDocument[0].text, null, "no caption on multipart");
+    assert.strictEqual(gate.sendDocument[0].client_nonce, docNonce);
+    assert.strictEqual(api.getState().sending, true);
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    assert.notStrictEqual(docNonce, textNonce);
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-DOC",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "text after document");
+    assert.strictEqual(api.getState().sending, true, "sending held across text");
+    assert.strictEqual(gate.send[0].text, "hello with pdf");
+    assert.strictEqual(gate.send[0].client_nonce, textNonce);
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-TXT",
+      deduplicated: false,
+    });
+    await p1;
+    await p2;
+    await settle;
+    assert.strictEqual(gate.sendDocument.length, 1);
+    assert.strictEqual(gate.send.length, 1);
+    assert.strictEqual(api.getState().hasImageDraft, false);
+    assert.strictEqual(api.getState().draft, "");
+    console.log("OK combined_document_then_text_success");
+    return;
+  }
+
+  if (scenario === "combined_document_failed_skips_text") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("keep me");
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "f.pdf", size: 12 })));
+    const docNonce = api.getImageAttemptNonce();
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "fail document");
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    gate.sendDocument[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle fail");
+    assert.strictEqual(gate.send.length, 0, "text not sent after document Failed");
+    assert.strictEqual(api.getState().hasImageDraft, true);
+    assert.strictEqual(api.getImageAttemptNonce(), docNonce);
+    assert.strictEqual(api.getState().draft, "keep me");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    console.log("OK combined_document_failed_skips_text");
+    return;
+  }
+
+  if (scenario === "combined_document_sent_text_failed_keeps_text") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("after document");
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "ok.pdf", size: 12 })));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "doc");
+    const textNonce = api.getSendAttemptNonce();
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-DOC",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "txt");
+    assert.strictEqual(gate.send[0].client_nonce, textNonce);
+    gate.send[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "text failed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(api.getState().hasImageDraft, false, "document cleared");
+    assert.strictEqual(api.getState().draft, "after document");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    assert.ok(api.getState().error);
+    console.log("OK combined_document_sent_text_failed_keeps_text");
+    return;
+  }
+
+  if (scenario === "document_switch_conversation_ignores_stale") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(rowB, []);
+    api.setDraft("text B");
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "b.pdf", size: 30 })));
+    await openReadyConversation(rowA, []);
+    api.setDraft("text A");
+    assert.ok(api.selectComposerAttachment(makeDocumentFile({ name: "a.pdf", size: 20 })));
+    const pSend = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "document A");
+    const msgBefore = gate.messages.length;
+    const panelBefore = gate.panel.length;
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length > msgBefore, "reopen B messages");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBefore, "reopen B panel");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    api.setDraft("text B newer");
+    assert.strictEqual(api.getImageDraft().filename, "b.pdf", "B preview restored from map");
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-A",
+      deduplicated: false,
+    });
+    await pSend;
+    await waitUntil(() => api.getState().sending === false, "send finished");
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    assert.strictEqual(api.getState().draft, "text B newer", "stale success must not clear B draft");
+    assert.strictEqual(api.getState().hasImageDraft, true, "B document kept");
+    assert.strictEqual(api.getImageDraft().filename, "b.pdf");
+    assert.strictEqual(gate.send.length, 0, "no accidental text send for B");
+    console.log("OK document_switch_conversation_ignores_stale");
+    return;
+  }
+
   function sendButton() {
     return root.querySelector(".oc-composer-send");
   }
@@ -3258,6 +3655,38 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_combined_image_sent_text_unknown_keeps_text(self):
 		out = self._run_scenario("combined_image_sent_text_unknown_keeps_text")
 		self.assertIn("OK combined_image_sent_text_unknown_keeps_text", out)
+
+	def test_document_select_preview_and_reject(self):
+		out = self._run_scenario("document_select_preview_and_reject")
+		self.assertIn("OK document_select_preview_and_reject", out)
+
+	def test_document_send_multipart_csrf_and_dedupe(self):
+		out = self._run_scenario("document_send_multipart_csrf_and_dedupe")
+		self.assertIn("OK document_send_multipart_csrf_and_dedupe", out)
+
+	def test_document_failed_keeps_selection(self):
+		out = self._run_scenario("document_failed_keeps_selection")
+		self.assertIn("OK document_failed_keeps_selection", out)
+
+	def test_document_uncertain_blocks_resend(self):
+		out = self._run_scenario("document_uncertain_blocks_resend")
+		self.assertIn("OK document_uncertain_blocks_resend", out)
+
+	def test_combined_document_then_text_success(self):
+		out = self._run_scenario("combined_document_then_text_success")
+		self.assertIn("OK combined_document_then_text_success", out)
+
+	def test_combined_document_failed_skips_text(self):
+		out = self._run_scenario("combined_document_failed_skips_text")
+		self.assertIn("OK combined_document_failed_skips_text", out)
+
+	def test_combined_document_sent_text_failed_keeps_text(self):
+		out = self._run_scenario("combined_document_sent_text_failed_keeps_text")
+		self.assertIn("OK combined_document_sent_text_failed_keeps_text", out)
+
+	def test_document_switch_conversation_ignores_stale(self):
+		out = self._run_scenario("document_switch_conversation_ignores_stale")
+		self.assertIn("OK document_switch_conversation_ignores_stale", out)
 
 	def test_combined_switch_during_image_defers_text(self):
 		out = self._run_scenario("combined_switch_during_image_defers_text")
