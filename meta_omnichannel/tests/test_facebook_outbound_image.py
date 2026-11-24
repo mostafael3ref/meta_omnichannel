@@ -1110,7 +1110,10 @@ class TestAttachOutboundDocumentFile(unittest.TestCase):
 		self.assertEqual(out["status"], "Ready")
 		self.assertEqual(out["file"], "FILE-DOC")
 		self.assertEqual(out["content_hash"], hashlib.sha256(_pdf()).hexdigest())
-		self.assertEqual(self.save_file.call_args.args[0], "report.pdf")
+		self.assertEqual(
+			self.save_file.call_args.args[0],
+			self.media._safe_filename("MSG-1", 0, _PDF_MIME),
+		)
 		self.assertEqual(self.save_file.call_args.kwargs.get("is_private"), 1)
 		ready_calls = [
 			c
@@ -1135,10 +1138,14 @@ class TestAttachOutboundDocumentFile(unittest.TestCase):
 			)
 		self.assertTrue(out["ok"])
 		self.assertEqual(out["status"], "Ready")
-		self.assertEqual(self.save_file.call_args.args[0], "notes.docx")
+		self.assertEqual(
+			self.save_file.call_args.args[0],
+			self.media._safe_filename("MSG-1", 0, _DOCX_MIME),
+		)
 		self.assertEqual(self.save_file.call_args.kwargs.get("is_private"), 1)
 
-	def test_sanitizes_filename_path_separators(self):
+	def test_document_disk_name_ignores_unsafe_upload_basename(self):
+		"""Original basenames with spaces/#/.. must not become File URLs."""
 		self._wire_message_and_child()
 		with patch.object(self.media, "_physical_file_exists", return_value=True), patch.object(
 			self.media, "_get_child_row", return_value=None
@@ -1149,9 +1156,17 @@ class TestAttachOutboundDocumentFile(unittest.TestCase):
 				"MSG-1",
 				_pdf(),
 				_PDF_MIME,
-				filename=r"..\..\evil/report.pdf",
+				filename=r"..\..\evil report#1.pdf",
 			)
-		self.assertEqual(self.save_file.call_args.args[0], ".._.._evil_report.pdf")
+		saved = self.save_file.call_args.args[0]
+		self.assertEqual(saved, self.media._safe_filename("MSG-1", 0, _PDF_MIME))
+		self.assertNotIn(" ", saved)
+		self.assertNotIn("#", saved)
+		self.assertNotIn("..", saved)
+		# Ready URL gate must accept the persisted path shape.
+		self.assertIsNotNone(
+			self.media._safe_private_file_url(f"/private/files/{saved}")
+		)
 
 	def test_duplicate_ready_reuses_without_save(self):
 		payload = _pdf()

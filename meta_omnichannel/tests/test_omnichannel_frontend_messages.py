@@ -402,6 +402,12 @@ class TestAttachmentRenderingSource(unittest.TestCase):
 		self.assertIn('rel: "noopener noreferrer"', js)
 		self.assertIn("onerror: onMediaError", js)
 		self.assertIn("replaceWith(renderSafeAttachmentLink", js)
+		# File/PDF Open must use authorized download_file — not raw /private/files href.
+		link_fn = js[
+			js.index("function renderSafeAttachmentLink") : js.index("function attachmentDownloadHref")
+		]
+		self.assertIn("attachmentDownloadHref(", link_fn)
+		self.assertNotIn("href: url,", link_fn)
 		# Must not fall back to label-only for attachments with URLs.
 		self.assertNotIn("el(\"div\", { text: m.text_content || m.message_type })", js)
 		self.assertIn("renderMessageBody(m)", js)
@@ -3458,6 +3464,169 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "mixed_image_pdf_open_links") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    // Image then PDF (mixed batch tip): File Open must use download_file, not raw private href.
+    await openReadyConversation(row, [
+      {
+        name: "MSG-IMG",
+        direction: "Outbound",
+        message_type: "Image",
+        text_content: "",
+        attachment_file_url: "/private/files/omni_MSG-IMG_0.png",
+        attachment_url: null,
+        sent_at: "1",
+      },
+      {
+        name: "MSG-PDF",
+        direction: "Outbound",
+        message_type: "File",
+        text_content: "",
+        attachment_file_url: "/private/files/omni_MSG-PDF_0.pdf",
+        attachment_url: null,
+        sent_at: "2",
+      },
+    ]);
+    assert.strictEqual(api.getState().messageCount, 2);
+    assert.ok(root.querySelector(".oc-attach-media"), "image thumb");
+    const pdfLink = root.querySelector(".oc-attach-link");
+    assert.ok(pdfLink, "PDF Open link present");
+    const href = pdfLink.getAttribute("href") || "";
+    assert.ok(href.indexOf("frappe.handler.download_file") >= 0, "authorized download_file");
+    assert.ok(href.indexOf("file_url=") >= 0);
+    assert.ok(href.indexOf("omni_MSG-PDF_0.pdf") >= 0);
+    assert.ok(!href.startsWith("/private/files/"), "must not use raw private href");
+
+    // PDF then image order.
+    const msgBefore = gate.messages.length;
+    const openAgain = api.openConversation(row);
+    await waitUntil(() => gate.messages.length > msgBefore, "reopen");
+    gate.messages[gate.messages.length - 1].d.resolve([
+      {
+        name: "MSG-PDF2",
+        direction: "Outbound",
+        message_type: "File",
+        text_content: "",
+        attachment_file_url: "/private/files/omni_MSG-PDF2_0.pdf",
+        attachment_url: null,
+        sent_at: "3",
+      },
+      {
+        name: "MSG-IMG2",
+        direction: "Outbound",
+        message_type: "Image",
+        text_content: "",
+        attachment_file_url: "/private/files/omni_MSG-IMG2_0.png",
+        attachment_url: null,
+        sent_at: "4",
+      },
+    ]);
+    await waitUntil(() => gate.panel.length >= 2, "panel again");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openAgain;
+    const links = Array.from(root.querySelectorAll(".oc-attach-link")).map(
+      (a) => a.getAttribute("href") || ""
+    );
+    assert.strictEqual(links.length, 1, "only File bubble uses Open link");
+    assert.ok(links[0].indexOf("omni_MSG-PDF2_0.pdf") >= 0);
+    assert.ok(links[0].indexOf("frappe.handler.download_file") >= 0);
+    assert.ok(root.querySelectorAll(".oc-attach-media").length >= 1, "image still thumbs");
+    console.log("OK mixed_image_pdf_open_links");
+    return;
+  }
+
+  if (scenario === "mixed_pdf_image_sequential_send") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(
+      api.selectComposerAttachment(
+        makeDocumentFile({ name: "Invoice #1.pdf", size: 40, lastModified: 1 })
+      )
+    );
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "shot.png", type: "image/png", size: 20, lastModified: 2 })
+      )
+    );
+    const drafts = api.getAttachmentDrafts();
+    assert.strictEqual(drafts[0].kind, "document");
+    assert.strictEqual(drafts[1].kind, "image");
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendDocument.length >= 1, "pdf first");
+    assert.strictEqual(gate.sendImage.length, 0, "image waits for pdf");
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-PDF",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.sendImage.length >= 1, "image second");
+    assert.strictEqual(gate.sendDocument.length, 1, "no duplicate pdf");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-IMG",
+      deduplicated: false,
+    });
+    // Drive soft refresh ourselves — settlePostSendRefresh would inject a text stub.
+    const mixedItems = [
+      {
+        name: "MSG-PDF",
+        direction: "Outbound",
+        message_type: "File",
+        text_content: "",
+        attachment_file_url: "/private/files/omni_MSG-PDF_0.pdf",
+        attachment_url: null,
+        sent_at: "1",
+      },
+      {
+        name: "MSG-IMG",
+        direction: "Outbound",
+        message_type: "Image",
+        text_content: "",
+        attachment_file_url: "/private/files/omni_MSG-IMG_0.png",
+        attachment_url: null,
+        sent_at: "2",
+      },
+    ];
+    for (let i = 0; i < 400; i++) {
+      for (const entry of gate.messages) {
+        if (!entry.d.isSettled()) entry.d.resolve(mixedItems);
+      }
+      for (const entry of gate.list) {
+        if (!entry.d.isSettled()) entry.d.resolve(bootItems);
+      }
+      if (api.getState().sending === false && api.getState().messageCount === 2) break;
+      await sleep(10);
+    }
+    await p;
+    assert.strictEqual(api.getState().sending, false);
+    assert.strictEqual(api.getState().attachmentCount, 0);
+    assert.strictEqual(api.getState().messageCount, 2);
+    const pdfLink = root.querySelector(".oc-attach-link");
+    assert.ok(pdfLink);
+    const pdfHref = pdfLink.getAttribute("href") || "";
+    assert.ok(pdfHref.indexOf("frappe.handler.download_file") >= 0);
+    assert.ok(pdfHref.indexOf("omni_MSG-PDF_0.pdf") >= 0);
+    assert.ok(root.querySelector(".oc-attach-media"));
+    console.log("OK mixed_pdf_image_sequential_send");
+    return;
+  }
+
   function dispatchDocumentKey(key, opts) {
     const ev = {
       key: key,
@@ -4838,6 +5007,14 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_five_attach_failed_unknown_and_switch(self):
 		out = self._run_scenario("five_attach_failed_unknown_and_switch")
 		self.assertIn("OK five_attach_failed_unknown_and_switch", out)
+
+	def test_mixed_image_pdf_open_links(self):
+		out = self._run_scenario("mixed_image_pdf_open_links")
+		self.assertIn("OK mixed_image_pdf_open_links", out)
+
+	def test_mixed_pdf_image_sequential_send(self):
+		out = self._run_scenario("mixed_pdf_image_sequential_send")
+		self.assertIn("OK mixed_pdf_image_sequential_send", out)
 
 	def test_upload_modal_open_close_preserves_queue(self):
 		out = self._run_scenario("upload_modal_open_close_preserves_queue")

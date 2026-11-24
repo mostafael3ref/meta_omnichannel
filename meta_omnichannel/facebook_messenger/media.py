@@ -582,12 +582,14 @@ def map_ready_attachment_file_urls(
 			"status": "Ready",
 		},
 		fields=["parent", "file", "content_hash", "status"],
-		limit_page_length=len(names),
+		# Unlimited: duplicate Ready children must not truncate other parents
+		# (mixed image+PDF pages were missing some attachment_file_url rows).
+		limit_page_length=0,
 	)
 	out: dict[str, str] = {}
 	for row in rows:
 		parent = (row.parent or "").strip()
-		if not parent or not (row.content_hash or "").strip():
+		if not parent or parent in out or not (row.content_hash or "").strip():
 			continue
 		if not _file_is_valid_private(row.file, parent):
 			continue
@@ -782,19 +784,12 @@ def persist_message_attachment(
 		)
 
 
-def _sanitize_outbound_file_basename(filename: str | None) -> str:
-	"""Strip path separators from a caller-provided upload name (never a URL)."""
-	raw = (filename or "").strip().replace("\\", "_").replace("/", "_")
-	return raw[:140]
-
-
 def _attach_outbound_bytes_file(
 	message_name: str,
 	content: bytes,
 	content_type: str,
 	*,
 	attachment_index: int = 0,
-	filename: str | None = None,
 	content_required_message: str,
 	mime_required_message: str,
 ) -> dict[str, Any]:
@@ -802,6 +797,12 @@ def _attach_outbound_bytes_file(
 
 	Does not call the Connector or commit/rollback. Reuses an existing Ready File
 	with the same content hash. Never returns ``file_url``.
+
+	Disk names always use ``_safe_filename`` (never the original upload basename).
+	Original names with spaces / ``#`` / ``..`` would produce File URLs that
+	``_safe_private_file_url`` rejects or that break raw Open hrefs — images
+	already used the safe stem; documents must match so mixed batches keep a
+	working ``attachment_file_url``.
 	"""
 	message_name = (message_name or "").strip()
 	index = _parse_attachment_index(attachment_index)
@@ -839,9 +840,7 @@ def _attach_outbound_bytes_file(
 	try:
 		file_name = existing_file
 		if not file_name:
-			fname = _sanitize_outbound_file_basename(filename) or _safe_filename(
-				message_name, index, mime
-			)
+			fname = _safe_filename(message_name, index, mime)
 			file_doc = save_file(
 				fname,
 				payload,
@@ -926,12 +925,14 @@ def attach_outbound_document_file(
 	if isinstance(content, (bytes, bytearray)) and len(bytes(content)) > MAX_OUTBOUND_DOCUMENT_BYTES:
 		frappe.throw(_("Document exceeds 8 MiB limit"), frappe.ValidationError)
 
+	# ``filename`` is accepted for API compatibility / Meta display upstream;
+	# private File basename is always ``_safe_filename`` inside the helper.
+	del filename
 	return _attach_outbound_bytes_file(
 		message_name,
 		content,
 		mime,
 		attachment_index=attachment_index,
-		filename=filename,
 		content_required_message=_("Outbound document content is required"),
 		mime_required_message=_("Outbound document MIME type is required"),
 	)

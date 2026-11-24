@@ -199,9 +199,16 @@
   }
 
   function renderSafeAttachmentLink(url, messageType) {
+    // Private Files must go through download_file (session + attached_to ACL).
+    // Raw ``/private/files/...`` Open hrefs 403/404 for many outbound PDFs
+    // (especially original upload names with spaces / ``#`` / ``..``).
+    const href = attachmentDownloadHref(url);
+    if (!href) {
+      return el("div", { className: "oc-attach-fallback", text: t("attachment_unavailable") });
+    }
     return el("a", {
       className: "oc-attach-link",
-      href: url,
+      href: href,
       target: "_blank",
       rel: "noopener noreferrer",
       text: attachmentLinkLabel(messageType),

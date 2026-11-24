@@ -171,6 +171,7 @@ class TestReadyAttachmentFileUrlHelper(unittest.TestCase):
 
 	def setUp(self):
 		self.frappe.get_all.return_value = []
+		self.frappe.db.get_value.side_effect = None
 		self.frappe.db.get_value.return_value = None
 
 	def test_rejects_non_ready_status(self):
@@ -227,10 +228,51 @@ class TestReadyAttachmentFileUrlHelper(unittest.TestCase):
 		self.assertIsNone(self.media._safe_private_file_url("/private/files/../etc/passwd"))
 		self.assertIsNone(self.media._safe_private_file_url("//evil.example/x"))
 		self.assertIsNone(self.media._safe_private_file_url("C:\\Windows\\x"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/my report.pdf"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/.._evil.pdf"))
 		self.assertEqual(
 			self.media._safe_private_file_url("/private/files/ok.jpg"),
 			"/private/files/ok.jpg",
 		)
+
+	def test_map_ready_does_not_truncate_when_extra_ready_rows(self):
+		"""Duplicate Ready children must not drop another parent's URL (mixed pages)."""
+		rows = [
+			SimpleNamespace(
+				parent="MSG-IMG",
+				file="FILE-IMG",
+				content_hash="h1",
+				status="Ready",
+			),
+			SimpleNamespace(
+				parent="MSG-IMG",
+				file="FILE-IMG-DUP",
+				content_hash="h1b",
+				status="Ready",
+			),
+			SimpleNamespace(
+				parent="MSG-PDF",
+				file="FILE-PDF",
+				content_hash="h2",
+				status="Ready",
+			),
+		]
+		self.frappe.get_all.return_value = rows
+
+		def _file_url(doctype, name, field=None):
+			return {
+				"FILE-IMG": "/private/files/omni_MSG-IMG_0.png",
+				"FILE-IMG-DUP": "/private/files/omni_MSG-IMG_dup.png",
+				"FILE-PDF": "/private/files/omni_MSG-PDF_0.pdf",
+			}.get(name)
+
+		self.frappe.db.get_value.side_effect = _file_url
+		with patch.object(self.media, "_file_is_valid_private", return_value=True):
+			mapped = self.media.map_ready_attachment_file_urls(["MSG-IMG", "MSG-PDF"])
+		kwargs = self.frappe.get_all.call_args.kwargs
+		self.assertEqual(kwargs.get("limit_page_length"), 0)
+		self.assertEqual(mapped["MSG-IMG"], "/private/files/omni_MSG-IMG_0.png")
+		self.assertEqual(mapped["MSG-PDF"], "/private/files/omni_MSG-PDF_0.pdf")
 
 
 class TestPreferredAttachmentUrlContract(unittest.TestCase):
