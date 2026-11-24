@@ -229,6 +229,15 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   line-height: 1;
   font-weight: 600;
 }
+.oc-composer-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  min-width: 0;
+  max-height: 11rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
 .oc-composer-preview {
   display: flex;
   align-items: center;
@@ -286,6 +295,240 @@ body { font-family: var(--oc-font); color: var(--oc-ink); background: var(--oc-b
   flex: 0 0 auto;
   padding: .4rem .65rem;
   font-size: .85rem;
+}
+.oc-upload-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(15, 22, 34, .45);
+}
+.oc-upload-dialog {
+  width: min(520px, 100%);
+  max-height: min(88vh, 640px);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(15, 22, 34, .22);
+  overflow: hidden;
+}
+.oc-upload-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .9rem 1rem;
+  border-bottom: 1px solid var(--oc-line);
+  flex: 0 0 auto;
+}
+.oc-upload-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+.oc-upload-close {
+  border: 0;
+  background: transparent;
+  color: var(--oc-muted);
+  font-size: 1.45rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: .15rem .4rem;
+  border-radius: 8px;
+}
+.oc-upload-close:hover { background: rgba(0, 0, 0, .05); color: var(--oc-ink); }
+.oc-upload-body-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.oc-upload-body { padding: 1rem; display: flex; flex-direction: column; gap: .9rem; }
+.oc-upload-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: .5rem;
+}
+.oc-upload-tab {
+  border: 1px solid var(--oc-line);
+  background: #fff;
+  color: var(--oc-ink);
+  border-radius: 10px;
+  padding: .65rem .75rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.oc-upload-tab.active {
+  border-color: var(--oc-accent);
+  background: var(--oc-accent-soft);
+  color: var(--oc-accent);
+}
+.oc-upload-panel { display: flex; flex-direction: column; gap: .85rem; min-width: 0; }
+.oc-upload-file {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.oc-upload-dropzone {
+  border: 1.5px dashed #c5ced8;
+  border-radius: 12px;
+  background: #fafbfc;
+  padding: 1.75rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+.oc-upload-dropzone:hover,
+.oc-upload-dropzone.is-dragover {
+  border-color: var(--oc-accent);
+  background: var(--oc-accent-soft);
+}
+.oc-upload-drop-icon {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--oc-accent);
+  margin-bottom: .45rem;
+}
+.oc-upload-drop-title {
+  font-weight: 600;
+  color: var(--oc-ink);
+}
+.oc-upload-drop-meta {
+  margin-top: .35rem;
+  font-size: .8rem;
+  color: var(--oc-muted);
+}
+.oc-upload-library {
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+  min-width: 0;
+}
+.oc-upload-library-search {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--oc-line);
+  border-radius: 10px;
+  padding: .65rem .75rem;
+  font: inherit;
+  background: #fff;
+  color: var(--oc-ink);
+}
+.oc-upload-library-search:focus {
+  outline: 2px solid var(--oc-accent-soft);
+  border-color: var(--oc-accent);
+}
+.oc-upload-library-status {
+  border: 1px dashed var(--oc-line);
+  border-radius: 12px;
+  padding: 1.25rem 1rem;
+  text-align: center;
+  color: var(--oc-muted);
+  background: #fafbfc;
+}
+.oc-upload-library-status.is-error { color: var(--oc-danger); border-color: rgba(185, 28, 28, .35); }
+.oc-upload-library-empty {
+  border: 1px dashed var(--oc-line);
+  border-radius: 12px;
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--oc-muted);
+  background: #fafbfc;
+}
+.oc-upload-library-list {
+  display: flex;
+  flex-direction: column;
+  gap: .4rem;
+  max-height: 14rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+  min-width: 0;
+}
+.oc-upload-library-row {
+  display: flex;
+  align-items: center;
+  gap: .65rem;
+  width: 100%;
+  text-align: start;
+  border: 1px solid var(--oc-line);
+  border-radius: 10px;
+  padding: .55rem .65rem;
+  background: #fff;
+  color: var(--oc-ink);
+  font: inherit;
+  cursor: pointer;
+}
+.oc-upload-library-row:hover { border-color: var(--oc-accent); background: var(--oc-accent-soft); }
+.oc-upload-library-row.is-selected {
+  border-color: var(--oc-accent);
+  background: var(--oc-accent-soft);
+}
+.oc-upload-library-row-main { min-width: 0; flex: 1 1 auto; }
+.oc-upload-library-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oc-upload-library-meta {
+  margin-top: .15rem;
+  font-size: .78rem;
+  color: var(--oc-muted);
+}
+.oc-upload-library-more { align-self: stretch; }
+.oc-upload-library-badge,
+.oc-composer-preview.is-library .oc-upload-library-badge {
+  flex: 0 0 auto;
+}
+.oc-upload-queue-item.is-library {
+  background: rgba(15, 118, 110, .06);
+}
+.oc-upload-queue {
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  min-width: 0;
+}
+.oc-upload-queue-title {
+  font-size: .82rem;
+  font-weight: 600;
+  color: var(--oc-muted);
+}
+.oc-upload-queue-item {
+  display: flex;
+  align-items: center;
+  gap: .65rem;
+  min-width: 0;
+  padding: .45rem .55rem;
+  border: 1px solid var(--oc-line);
+  border-radius: 10px;
+  background: rgba(15, 118, 110, .04);
+}
+.oc-upload-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: .5rem;
+  padding: .85rem 1rem;
+  border-top: 1px solid var(--oc-line);
+  background: #fff;
+  flex: 0 0 auto;
+}
+.oc-upload-add { min-width: 9rem; }
+@media (max-width: 560px) {
+  .oc-upload-dialog { width: 100%; max-height: 92vh; border-radius: 12px; }
+  .oc-upload-tabs { grid-template-columns: 1fr; }
 }
 .oc-customer {
   padding: 1rem; border-inline-end: 0;

@@ -482,6 +482,336 @@ def send_document_message(
 	)
 
 
+# --- ERPNext File Library (selectable outbound attachments) -----------------
+# List returns safe metadata only (never file_url / bytes). Send re-checks File
+# + attached-document read access, reads a bounded byte window from disk, then
+# reuses send_facebook_image / send_facebook_document (which copy into a new
+# private outbound File and leave the source File untouched).
+
+_LIBRARY_MAX_BYTES = 8 * 1024 * 1024
+_LIBRARY_TYPE_BY_EXT: dict[str, tuple[str, str]] = {
+	".jpg": ("image", "image/jpeg"),
+	".jpeg": ("image", "image/jpeg"),
+	".png": ("image", "image/png"),
+	".gif": ("image", "image/gif"),
+	".pdf": ("document", "application/pdf"),
+	".docx": (
+		"document",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	),
+}
+_LIBRARY_EXTENSIONS = tuple(_LIBRARY_TYPE_BY_EXT.keys())
+
+
+def _library_extension(file_name: str | None) -> str:
+	name = str(file_name or "").strip().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+	if "." not in name:
+		return ""
+	return "." + name.rsplit(".", 1)[-1].lower()
+
+
+def _library_type_for_filename(file_name: str | None) -> tuple[str, str] | None:
+	return _LIBRARY_TYPE_BY_EXT.get(_library_extension(file_name))
+
+
+def _sanitize_library_search(search: str | None) -> str:
+	"""Strip LIKE wildcards so callers cannot broaden the extension filter."""
+	return (
+		str(search or "")
+		.strip()
+		.replace("%", "")
+		.replace("_", "")
+		.replace("\\", "")
+	)
+
+
+def _library_list_filters(search: str | None) -> list[list]:
+	filters: list[list] = [
+		["is_folder", "=", 0],
+		["file_size", ">", 0],
+		["file_size", "<=", _LIBRARY_MAX_BYTES],
+	]
+	term = _sanitize_library_search(search)
+	if term:
+		filters.append(["file_name", "like", f"%{term}%"])
+	return filters
+
+
+def _library_extension_or_filters() -> list[list]:
+	# Case-insensitive LIKE on typical MySQL/MariaDB collations; include both cases
+	# for sites that use binary/CS collations.
+	out: list[list] = []
+	for ext in _LIBRARY_EXTENSIONS:
+		out.append(["file_name", "like", f"%{ext}"])
+		upper = ext.upper()
+		if upper != ext:
+			out.append(["file_name", "like", f"%{upper}"])
+	return out
+
+
+def _file_doc_has_read(file_doc) -> bool:
+	"""True when the session user may read this File row (Frappe File ACL)."""
+	try:
+		has_perm = getattr(file_doc, "has_permission", None)
+		if callable(has_perm):
+			return bool(has_perm("read"))
+		return bool(frappe.has_permission("File", "read", doc=file_doc))
+	except Exception:
+		return False
+
+
+def _attached_document_has_read(file_doc) -> bool:
+	"""Re-check read access on the underlying attached document when present."""
+	doctype = str(getattr(file_doc, "attached_to_doctype", None) or "").strip()
+	name = str(getattr(file_doc, "attached_to_name", None) or "").strip()
+	if not doctype or not name:
+		return True
+	try:
+		if not frappe.has_permission(doctype, "read", doc=name):
+			return False
+		ref = frappe.get_doc(doctype, name)
+		has_perm = getattr(ref, "has_permission", None)
+		if callable(has_perm) and not has_perm("read"):
+			return False
+		return True
+	except Exception:
+		return False
+
+
+def _user_can_select_library_file(file_doc) -> bool:
+	if cint(getattr(file_doc, "is_folder", 0)):
+		return False
+	if not _library_type_for_filename(getattr(file_doc, "file_name", None)):
+		return False
+	size = cint(getattr(file_doc, "file_size", 0))
+	if size <= 0 or size > _LIBRARY_MAX_BYTES:
+		return False
+	if not _file_doc_has_read(file_doc):
+		return False
+	if not _attached_document_has_read(file_doc):
+		return False
+	return True
+
+
+def _serialize_library_file(file_doc) -> dict[str, Any]:
+	"""Safe metadata only — never ``file_url`` or content bytes."""
+	kind_mime = _library_type_for_filename(getattr(file_doc, "file_name", None))
+	kind, content_type = kind_mime if kind_mime else ("", "")
+	return {
+		"name": str(getattr(file_doc, "name", "") or ""),
+		"file_name": str(getattr(file_doc, "file_name", None) or ""),
+		"file_size": cint(getattr(file_doc, "file_size", 0)),
+		"kind": kind,
+		"content_type": content_type,
+		"is_private": bool(cint(getattr(file_doc, "is_private", 0))),
+	}
+
+
+def _open_library_file_for_send(file: str, *, expected_kind: str):
+	"""Resolve File by name, re-check ACL, return ``(file_doc, kind, mime_hint)``."""
+	name = str(file or "").strip()
+	if not name:
+		frappe.throw(_("File is required"), frappe.ValidationError)
+	if expected_kind not in ("image", "document"):
+		frappe.throw(_("Invalid attachment kind"), frappe.ValidationError)
+
+	file_doc = frappe.get_doc("File", name)
+	if not _user_can_select_library_file(file_doc):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	kind_mime = _library_type_for_filename(getattr(file_doc, "file_name", None))
+	if not kind_mime or kind_mime[0] != expected_kind:
+		label = "image" if expected_kind == "image" else "document"
+		frappe.throw(
+			_("Selected file is not a valid {0}").format(label),
+			frappe.ValidationError,
+		)
+	return file_doc, kind_mime[0], kind_mime[1]
+
+
+def _read_library_file_bounded(file_doc, *, max_bytes: int, label: str) -> bytes:
+	"""Read at most ``max_bytes + 1`` from the File on disk (never unbounded)."""
+	# Recheck ACL immediately before any byte I/O.
+	if not _user_can_select_library_file(file_doc):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	data: bytes | None = None
+	get_full_path = getattr(file_doc, "get_full_path", None)
+	if callable(get_full_path):
+		path = get_full_path()
+		if not path:
+			frappe.throw(_("{0} content is unavailable").format(label), frappe.ValidationError)
+		# validate_file_path (inside get_full_path) must keep us under the site files root.
+		with open(path, "rb") as handle:
+			chunk = handle.read(max_bytes + 1)
+		data = b"" if chunk is None else bytes(chunk)
+	else:
+		# Fallback for test doubles / in-memory File rows without a path helper.
+		raw = getattr(file_doc, "content", None)
+		if isinstance(raw, (bytes, bytearray)):
+			data = bytes(raw[: max_bytes + 1])
+		elif isinstance(raw, str):
+			encoded = raw.encode("utf-8", errors="ignore")
+			data = encoded[: max_bytes + 1]
+		else:
+			frappe.throw(_("{0} content is unavailable").format(label), frappe.ValidationError)
+
+	if len(data) > max_bytes:
+		frappe.throw(_("{0} exceeds 8 MiB limit").format(label), frappe.ValidationError)
+	if not data:
+		frappe.throw(_("{0} content is unavailable").format(label), frappe.ValidationError)
+	return data
+
+
+def _send_from_library_file(
+	*,
+	conversation: str,
+	file: str,
+	client_nonce: str,
+	expected_kind: str,
+) -> dict:
+	ensure_omnichannel_agent()
+	client_nonce = (client_nonce or "").strip()
+	if not client_nonce:
+		frappe.throw(_("client_nonce is required"), frappe.ValidationError)
+
+	conv = frappe.get_doc("Omnichannel Conversation", conversation)
+	if not has_conversation_permission(conv, "write"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	if conv.provider != "Facebook":
+		frappe.throw(
+			_("Outbound messaging for {0} is not available until the connector API is confirmed").format(
+				conv.provider
+			)
+		)
+
+	from meta_omnichannel.facebook_messenger.adapter import (
+		MAX_OUTBOUND_DOCUMENT_BYTES,
+		MAX_OUTBOUND_IMAGE_BYTES,
+	)
+	from meta_omnichannel.facebook_messenger.outbound import (
+		send_facebook_document,
+		send_facebook_image,
+	)
+
+	file_doc, _kind, mime_hint = _open_library_file_for_send(
+		file, expected_kind=expected_kind
+	)
+	max_bytes = (
+		MAX_OUTBOUND_IMAGE_BYTES if expected_kind == "image" else MAX_OUTBOUND_DOCUMENT_BYTES
+	)
+	label = "Image" if expected_kind == "image" else "Document"
+	payload = _read_library_file_bounded(file_doc, max_bytes=max_bytes, label=label)
+	safe_filename = str(getattr(file_doc, "file_name", None) or "").strip() or None
+
+	# Outbound helpers validate magic bytes, persist a *new* private File on the
+	# Omnichannel Message, and leave the source ERPNext File unchanged.
+	if expected_kind == "image":
+		return send_facebook_image(
+			conversation_name=conversation,
+			client_nonce=client_nonce,
+			image_bytes=payload,
+			filename=safe_filename,
+			content_type=mime_hint,
+		)
+	return send_facebook_document(
+		conversation_name=conversation,
+		client_nonce=client_nonce,
+		document_bytes=payload,
+		filename=safe_filename,
+		content_type=mime_hint,
+	)
+
+
+@frappe.whitelist()
+def list_selectable_outbound_files(
+	search: str | None = None,
+	limit: int = 30,
+	offset: int = 0,
+) -> dict:
+	"""List ERPNext Files the agent may pick for Messenger outbound send.
+
+	Returns safe metadata only (no ``file_url``, no bytes). Candidates are limited
+	to JPEG/PNG/GIF/PDF/DOCX at most 8 MiB. Each row is re-checked for File read
+	permission and underlying attached-document read access.
+	"""
+	ensure_omnichannel_agent()
+	limit = max(1, min(cint(limit), 100))
+	offset = max(0, cint(offset))
+
+	filters = _library_list_filters(search)
+	or_filters = _library_extension_or_filters()
+	rows = frappe.get_list(
+		"File",
+		filters=filters,
+		or_filters=or_filters,
+		fields=[
+			"name",
+			"file_name",
+			"file_size",
+			"is_private",
+			"is_folder",
+			"attached_to_doctype",
+			"attached_to_name",
+		],
+		order_by="modified desc",
+		limit_page_length=limit,
+		limit_start=offset,
+	)
+
+	items: list[dict[str, Any]] = []
+	for row in rows:
+		name = str(
+			getattr(row, "name", None)
+			or (row.get("name") if isinstance(row, dict) else "")
+			or ""
+		)
+		if not name:
+			continue
+		try:
+			file_doc = frappe.get_doc("File", name)
+		except Exception:
+			continue
+		if not _user_can_select_library_file(file_doc):
+			continue
+		items.append(_serialize_library_file(file_doc))
+
+	# Pagination follows the DB candidate window (extension/size/search + File
+	# permission_query_conditions). Per-row attached-doc ACL may still drop items,
+	# so ``items`` can be shorter than ``limit`` even when ``has_more`` is true.
+	has_more = len(rows) == limit
+	return {
+		"items": items,
+		"total": offset + len(rows) + (1 if has_more else 0),
+		"limit": limit,
+		"offset": offset,
+		"has_more": has_more,
+		"next_offset": offset + len(rows) if has_more else None,
+	}
+
+
+@frappe.whitelist()
+def send_image_from_file(conversation: str, file: str, client_nonce: str) -> dict:
+	"""Send one Facebook Messenger image from an existing ERPNext File (by name)."""
+	return _send_from_library_file(
+		conversation=conversation,
+		file=file,
+		client_nonce=client_nonce,
+		expected_kind="image",
+	)
+
+
+@frappe.whitelist()
+def send_document_from_file(conversation: str, file: str, client_nonce: str) -> dict:
+	"""Send one Facebook Messenger PDF/DOCX from an existing ERPNext File (by name)."""
+	return _send_from_library_file(
+		conversation=conversation,
+		file=file,
+		client_nonce=client_nonce,
+		expected_kind="document",
+	)
+
+
 def _ensure_can_trigger_connector_sync() -> None:
 	"""Agents and admins may trigger connector sync; others are rejected."""
 	ensure_omnichannel_agent()

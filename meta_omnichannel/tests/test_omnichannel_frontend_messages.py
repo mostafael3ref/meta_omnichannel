@@ -709,26 +709,24 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		"""Post-send must not flash full-chat Loading via openConversation."""
 		js = PLAIN_JS.read_text(encoding="utf-8")
 		send_msg = js[
-			js.index("async function sendMessage()") : js.index("async function sendImageMessage()")
+			js.index("async function sendMessage()") : js.index("async function sendAttachmentQueue")
 		]
-		send_img = js[
-			js.index("async function sendImageMessage()") : js.index(
-				"async function sendCombinedImageAndText()"
-			)
-		]
-		combined = js[
-			js.index("async function sendCombinedImageAndText()") : js.index(
-				"function sendComposer()"
+		send_queue = js[
+			js.index("async function sendAttachmentQueue") : js.index(
+				"async function sendImageMessage()"
 			)
 		]
 		for body, label in (
 			(send_msg, "sendMessage"),
-			(send_img, "sendImageMessage"),
-			(combined, "sendCombinedImageAndText"),
+			(send_queue, "sendAttachmentQueue"),
 		):
 			self.assertIn("refreshAfterSend(", body, label)
 			self.assertNotIn("openConversation(", body, label)
 			self.assertNotIn("loadingChat = true", body, label)
+		# Thin wrappers must delegate to the shared queue / soft-refresh path.
+		self.assertIn("sendAttachmentQueue", js)
+		self.assertIn("async function sendImageMessage()", js)
+		self.assertIn("async function sendCombinedImageAndText()", js)
 		refresh = js[
 			js.index("async function refreshAfterSend") : js.index("async function openConversation")
 		]
@@ -803,7 +801,9 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("result && result.ok", helper)
 		self.assertIn("state.draft = \"\"", helper)
 		self.assertIn("result.uncertain", helper)
-		send_fn = js[js.index("async function sendMessage") : js.index("async function sendImageMessage")]
+		send_fn = js[
+			js.index("async function sendMessage") : js.index("async function sendAttachmentQueue")
+		]
 		self.assertIn("applyTextSendResult", send_fn)
 		self.assertIn("myGen !== sendGeneration", send_fn)
 		# Composer disables while sending.
@@ -822,44 +822,86 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("credentials: \"same-origin\"", multipart)
 		self.assertIn("function selectComposerImage", js)
 		self.assertIn("function selectComposerAttachment", js)
+		self.assertIn("function selectComposerAttachments", js)
 		self.assertIn("function sendImageMessage", js)
 		self.assertIn("function sendComposer", js)
+		self.assertIn("function sendAttachmentQueue", js)
 		self.assertIn("imageDrafts", js)
 		self.assertIn("MAX_COMPOSER_IMAGE_BYTES", js)
 		self.assertIn("MAX_COMPOSER_ATTACHMENT_BYTES", js)
+		self.assertIn("MAX_COMPOSER_ATTACHMENTS", js)
 		self.assertIn("blockResend", js)
 		self.assertIn("image_only_hint", js)
 		self.assertIn("image_and_text_hint", js)
 		self.assertIn("image_sent_text_pending", js)
 		self.assertIn("document_only_hint", js)
 		self.assertIn("document_and_text_hint", js)
+		self.assertIn("attachments_only_hint", js)
 		self.assertIn("function sendCombinedImageAndText", js)
 		self.assertIn("function syncComposerControls", js)
 		self.assertIn("oc-composer-send", js)
 		self.assertIn("oc-composer-attach", js)
 		self.assertIn("COMPOSER_ACCEPT", js)
+		self.assertIn("multiple: true", js)
 		self.assertIn(".pdf", js)
 		self.assertIn(".docx", js)
 		self.assertIn('field: "document"', js)
-		# Captions unsupported — multipart image request must not append draft text.
-		combined = js[
-			js.index("async function sendCombinedImageAndText") : js.index("function sendComposer")
+		# ERPNext-style Upload modal (device + Library stub).
+		self.assertIn("function openUploadModal", js)
+		self.assertIn("function closeUploadModal", js)
+		self.assertIn("function syncUploadModalContent", js)
+		self.assertIn("openUploadModal(ev && ev.currentTarget)", js)
+		self.assertIn("oc-upload-file", js)
+		self.assertIn("oc-upload-dropzone", js)
+		self.assertIn("upload_modal_title", js)
+		self.assertIn("upload_my_device", js)
+		self.assertIn("upload_library", js)
+		self.assertIn("upload_add_attachments", js)
+		self.assertIn("upload_library_search", js)
+		self.assertIn("upload_library_load_more", js)
+		self.assertIn("list_selectable_outbound_files", js)
+		self.assertIn("send_image_from_file", js)
+		self.assertIn("send_document_from_file", js)
+		self.assertIn("selectLibraryAttachment", js)
+		self.assertIn("libraryMethod", js)
+		self.assertIn('upload_my_device: "جهازي"', js)
+		self.assertIn('upload_library_search: "بحث في الملفات"', js)
+		self.assertIn('upload_library_load_more: "تحميل المزيد"', js)
+		self.assertIn('dir: rtl ? "rtl" : "ltr"', js)
+		self.assertIn("document.body || root", js)
+		self.assertIn('key === "Escape"', js)
+		self.assertIn("getUploadModalFocusables", js)
+		self.assertNotIn("className: \"oc-composer-file\"", js)
+		# Captions unsupported — multipart attachment request must not append draft text.
+		queue = js[
+			js.index("async function sendAttachmentQueue") : js.index(
+				"async function sendImageMessage"
+			)
 		]
-		self.assertIn("callMultipart", combined)
+		self.assertIn("callMultipart", queue)
 		# Caption field must not ride on the multipart call (only later send_message).
-		self.assertNotIn("text: text", combined.split("send_message")[0])
-		self.assertIn("spec.field", combined)
-		self.assertIn("client_nonce: imageNonce", combined)
-		# Text follows only after confirmed image ok; never as image caption field.
-		self.assertIn("send_message", combined)
-		self.assertIn("stashDeferredText", combined)
+		self.assertNotIn("text: text", queue.split("send_message")[0])
+		self.assertIn("spec.field", queue)
+		self.assertIn("client_nonce: snap.nonce", queue)
+		# Text follows only after confirmed attachments ok; never as caption field.
+		self.assertIn("send_message", queue)
+		self.assertIn("stashDeferredText", queue)
 		css = (ROOT / "meta_omnichannel" / "public" / "frontend" / "omnichannel.css").read_text(
 			encoding="utf-8"
 		)
 		self.assertIn(".oc-composer-preview", css)
+		self.assertIn(".oc-composer-attachments", css)
 		self.assertIn(".oc-composer-row.has-attach", css)
 		self.assertIn(".oc-composer-doc-badge", css)
 		self.assertIn(".oc-composer-filesize", css)
+		self.assertIn(".oc-upload-modal", css)
+		self.assertIn(".oc-upload-dialog", css)
+		self.assertIn(".oc-upload-dropzone", css)
+		self.assertIn(".oc-upload-library-empty", css)
+		self.assertIn(".oc-upload-library-search", css)
+		self.assertIn(".oc-upload-library-more", css)
+		self.assertIn(".oc-upload-add", css)
+		self.assertIn("@media (max-width: 560px)", css)
 
 
 def _find_node_executable() -> Optional[str]:
@@ -900,9 +942,12 @@ function createEl(tag) {
   const node = {
     tagName: String(tag).toUpperCase(),
     className: "",
+    id: "",
     style: {},
     children: kids,
     childNodes: kids,
+    get firstChild() { return kids[0] || null; },
+    get lastChild() { return kids.length ? kids[kids.length - 1] : null; },
     parentNode: null,
     value: "",
     textContent: "",
@@ -939,6 +984,7 @@ function createEl(tag) {
       if (k === "value") node.value = v;
       if (k === "type") node.type = String(v);
       if (k === "class") node.className = v;
+      if (k === "id") node.id = String(v);
       // Mirror browser: presence of disabled attribute disables the control.
       if (k === "disabled") node.disabled = true;
     },
@@ -946,7 +992,9 @@ function createEl(tag) {
       delete attrs[k];
       if (k === "disabled") node.disabled = false;
     },
-    getAttribute(k) { return attrs[k]; },
+    getAttribute(k) {
+      return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null;
+    },
     addEventListener(type, fn) {
       (listeners[type] = listeners[type] || []).push(fn);
     },
@@ -983,7 +1031,7 @@ function createEl(tag) {
     setSelectionRange(a, b) { node.selectionStart = a; node.selectionEnd = b; },
     click() {
       const fns = listeners.click || [];
-      fns.forEach((fn) => fn({ type: "click", target: node }));
+      fns.forEach((fn) => fn({ type: "click", target: node, currentTarget: node }));
     },
     files: null,
     querySelector(sel) { return queryOne(node, sel); },
@@ -1034,14 +1082,20 @@ function makeDocumentFile(overrides) {
 
 function matchSel(node, sel) {
   if (!sel) return false;
+  if (sel.startsWith("#")) {
+    const id = sel.slice(1).split(/[\s>\.\[]/)[0];
+    return String(node.id || node.getAttribute("id") || "") === id;
+  }
   if (sel.startsWith(".")) {
-    const cls = sel.slice(1).split(/[\s>\[]/)[0];
-    return String(node.className || "").split(/\s+/).includes(cls);
+    const classes = sel.slice(1).split(".").map((c) => c.split(/[\s>\[]/)[0]).filter(Boolean);
+    const have = String(node.className || "").split(/\s+/);
+    return classes.length > 0 && classes.every((c) => have.includes(c));
   }
   if (sel.includes("[")) {
     const base = sel.replace(/\[.*$/, "");
     if (base && !matchSel(node, base)) return false;
     if (/type=['"]search['"]/.test(sel)) return node.type === "search";
+    if (/\[tabindex\]/.test(sel)) return node.getAttribute("tabindex") != null;
     return true;
   }
   if (sel.includes(".")) {
@@ -1058,7 +1112,18 @@ function walk(node, out) {
   (node.children || []).forEach((c) => walk(c, out));
 }
 function queryAll(rootNode, sel) {
-  const parts = sel.trim().split(/\s+/);
+  const trimmed = String(sel || "").trim();
+  if (trimmed.includes(",")) {
+    const out = [];
+    trimmed.split(",").forEach((part) => {
+      queryAll(rootNode, part.trim()).forEach((n) => {
+        if (out.indexOf(n) < 0) out.push(n);
+      });
+    });
+    out.forEach = Array.prototype.forEach;
+    return out;
+  }
+  const parts = trimmed.split(/\s+/);
   let set = [rootNode];
   for (const part of parts) {
     const next = [];
@@ -1082,8 +1147,22 @@ function queryOne(rootNode, sel) {
 const root = createEl("div");
 root.id = "omnichannel-app";
 root.querySelector = (sel) => queryOne(root, sel);
+root.querySelectorAll = (sel) => queryAll(root, sel);
+const bodyEl = createEl("body");
+bodyEl.querySelector = (sel) => queryOne(bodyEl, sel);
+bodyEl.querySelectorAll = (sel) => queryAll(bodyEl, sel);
 
-const gate = { list: [], messages: [], panel: [], send: [], sendImage: [], sendDocument: [] };
+const gate = {
+  list: [],
+  messages: [],
+  panel: [],
+  send: [],
+  sendImage: [],
+  sendDocument: [],
+  libraryList: [],
+  sendImageFromFile: [],
+  sendDocumentFromFile: [],
+};
 let nonceSeq = 0;
 function defer() {
   let settled = false;
@@ -1213,9 +1292,28 @@ const sandbox = {
   },
   document: {
     activeElement: null,
-    getElementById(id) { return id === "omnichannel-app" ? root : null; },
+    body: bodyEl,
+    getElementById(id) {
+      if (id === "omnichannel-app") return root;
+      return queryOne(bodyEl, "#" + id) || queryOne(root, "#" + id) || null;
+    },
     createElement: createEl,
-    querySelector(sel) { return queryOne(root, sel); },
+    querySelector(sel) { return queryOne(bodyEl, sel) || queryOne(root, sel); },
+    querySelectorAll(sel) {
+      const a = queryAll(bodyEl, sel);
+      const b = queryAll(root, sel);
+      return a.concat(b);
+    },
+    addEventListener(type, fn) {
+      (sandbox.document._listeners = sandbox.document._listeners || {});
+      (sandbox.document._listeners[type] = sandbox.document._listeners[type] || []).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = (sandbox.document._listeners && sandbox.document._listeners[type]) || [];
+      if (sandbox.document._listeners) {
+        sandbox.document._listeners[type] = list.filter((x) => x !== fn);
+      }
+    },
   },
   fetch: async (url, opts) => {
     const path = String(url || "");
@@ -1265,6 +1363,39 @@ const sandbox = {
       return { ok: true, json: async () => ({ message: payload }) };
     }
     const params = new URLSearchParams(opts.body);
+    if (path.indexOf("list_selectable_outbound_files") !== -1) {
+      const entry = {
+        search: params.get("search") || "",
+        limit: params.get("limit") || "",
+        offset: params.get("offset") || "",
+        d: defer(),
+      };
+      gate.libraryList.push(entry);
+      const payload = await entry.d;
+      return { ok: true, json: async () => ({ message: payload }) };
+    }
+    if (path.indexOf("send_image_from_file") !== -1) {
+      const entry = {
+        conversation: params.get("conversation") || "",
+        file: params.get("file") || "",
+        client_nonce: params.get("client_nonce") || "",
+        d: defer(),
+      };
+      gate.sendImageFromFile.push(entry);
+      const payload = await entry.d;
+      return { ok: true, json: async () => ({ message: payload }) };
+    }
+    if (path.indexOf("send_document_from_file") !== -1) {
+      const entry = {
+        conversation: params.get("conversation") || "",
+        file: params.get("file") || "",
+        client_nonce: params.get("client_nonce") || "",
+        d: defer(),
+      };
+      gate.sendDocumentFromFile.push(entry);
+      const payload = await entry.d;
+      return { ok: true, json: async () => ({ message: payload }) };
+    }
     if (path.indexOf("list_conversations") !== -1) {
       const entry = { search: params.get("search") || "", d: defer() };
       gate.list.push(entry);
@@ -2247,6 +2378,8 @@ async function settleOpenListCalls(items) {
     await openReadyConversation(row, []);
     assert.strictEqual(api.selectComposerImage(makeImageFile({})), false);
     assert.ok(!root.querySelector(".oc-composer-attach"));
+    assert.strictEqual(api.openUploadModal(null), false);
+    assert.strictEqual(api.isUploadModalOpen(), false);
     console.log("OK image_instagram_no_attach");
     return;
   }
@@ -2487,7 +2620,9 @@ async function settleOpenListCalls(items) {
         })
       )
     );
-    assert.strictEqual(api.getImageDraft().typeLabel, "DOCX");
+    const drafts = api.getAttachmentDrafts();
+    assert.strictEqual(drafts.length, 2, "pdf and docx both queued");
+    assert.strictEqual(drafts[1].typeLabel, "DOCX");
     assert.strictEqual(
       api.selectComposerAttachment(makeDocumentFile({ name: "x.txt", type: "text/plain", size: 10 })),
       false
@@ -2794,6 +2929,731 @@ async function settleOpenListCalls(items) {
     assert.strictEqual(api.getImageDraft().filename, "b.pdf");
     assert.strictEqual(gate.send.length, 0, "no accidental text send for B");
     console.log("OK document_switch_conversation_ignores_stale");
+    return;
+  }
+
+  if (scenario === "multi_attach_queue_preview_and_cap") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.strictEqual(
+      api.selectComposerAttachments([
+        makeImageFile({ name: "a.png", type: "image/png", size: 10, lastModified: 1 }),
+        makeImageFile({ name: "b.png", type: "image/png", size: 11, lastModified: 2 }),
+        makeDocumentFile({ name: "c.pdf", size: 12, lastModified: 3 }),
+      ]),
+      3
+    );
+    assert.strictEqual(api.getState().attachmentCount, 3);
+    assert.strictEqual(api.getAttachmentDrafts().length, 3);
+    assert.ok(root.querySelector(".oc-composer-attachments"));
+    assert.strictEqual(root.querySelectorAll(".oc-composer-preview").length, 3);
+    const n1 = api.getAttachmentDrafts()[0].nonce;
+    const n2 = api.getAttachmentDrafts()[1].nonce;
+    const n3 = api.getAttachmentDrafts()[2].nonce;
+    assert.ok(n1 && n2 && n3);
+    assert.notStrictEqual(n1, n2);
+    assert.notStrictEqual(n2, n3);
+    api.removeComposerAttachment(api.getAttachmentDrafts()[1].id);
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.strictEqual(api.getAttachmentDrafts()[0].filename, "a.png");
+    assert.strictEqual(api.getAttachmentDrafts()[1].filename, "c.pdf");
+    for (let i = 0; i < 8; i++) {
+      assert.ok(
+        api.selectComposerAttachment(
+          makeImageFile({
+            name: "x" + i + ".png",
+            type: "image/png",
+            size: 8 + i,
+            lastModified: 100 + i,
+          })
+        )
+      );
+    }
+    assert.strictEqual(api.getState().attachmentCount, 10);
+    assert.strictEqual(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "overflow.png", type: "image/png", size: 9, lastModified: 999 })
+      ),
+      false
+    );
+    assert.ok(String(api.getState().error || "").indexOf("10") >= 0);
+    console.log("OK multi_attach_queue_preview_and_cap");
+    return;
+  }
+
+  if (scenario === "multi_attach_sequential_send") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("");
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "1.png", type: "image/png", size: 10, lastModified: 1 })
+      )
+    );
+    assert.ok(
+      api.selectComposerAttachment(
+        makeDocumentFile({ name: "2.pdf", size: 20, lastModified: 2 })
+      )
+    );
+    const drafts = api.getAttachmentDrafts();
+    const n1 = drafts[0].nonce;
+    const n2 = drafts[1].nonce;
+    const p1 = api.sendComposer();
+    const p2 = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "first image");
+    assert.strictEqual(gate.sendImage.length, 1);
+    assert.strictEqual(gate.sendDocument.length, 0, "second waits for first");
+    assert.strictEqual(gate.sendImage[0].client_nonce, n1);
+    assert.strictEqual(api.getState().sending, true);
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.sendDocument.length >= 1, "second document");
+    assert.strictEqual(gate.sendDocument[0].client_nonce, n2);
+    assert.strictEqual(gate.send.length, 0);
+    const settle = settlePostSendRefresh();
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-2",
+      deduplicated: false,
+    });
+    await p1;
+    await p2;
+    await settle;
+    assert.strictEqual(api.getState().attachmentCount, 0);
+    assert.strictEqual(api.getState().hasImageDraft, false);
+    console.log("OK multi_attach_sequential_send");
+    return;
+  }
+
+  if (scenario === "multi_attach_failed_stops_and_preserves") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("keep text");
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "1.png", type: "image/png", size: 10, lastModified: 1 })
+      )
+    );
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "2.png", type: "image/png", size: 11, lastModified: 2 })
+      )
+    );
+    const n1 = api.getAttachmentDrafts()[0].nonce;
+    const n2 = api.getAttachmentDrafts()[1].nonce;
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "fail first");
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(gate.sendImage.length, 1, "stopped after first failure");
+    assert.strictEqual(gate.send.length, 0, "text not sent");
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.strictEqual(api.getAttachmentDrafts()[0].nonce, n1);
+    assert.strictEqual(api.getAttachmentDrafts()[1].nonce, n2);
+    assert.strictEqual(api.getState().draft, "keep text");
+    assert.strictEqual(api.getSendAttemptNonce(), textNonce);
+    console.log("OK multi_attach_failed_stops_and_preserves");
+    return;
+  }
+
+  if (scenario === "multi_attach_unknown_blocks_and_preserves") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("maybe later");
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "1.png", type: "image/png", size: 10, lastModified: 1 })
+      )
+    );
+    assert.ok(
+      api.selectComposerAttachment(
+        makeDocumentFile({ name: "2.pdf", size: 12, lastModified: 2 })
+      )
+    );
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "unknown first");
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(gate.sendDocument.length, 0, "second not started");
+    assert.strictEqual(gate.send.length, 0);
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.ok(api.getAttachmentDrafts()[0].blockResend);
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("unconfirmed") >= 0);
+    assert.strictEqual(api.getState().canSend, false, "blocked until uncertain removed");
+    await api.sendComposer();
+    assert.strictEqual(gate.sendImage.length, 1, "no auto retry");
+    console.log("OK multi_attach_unknown_blocks_and_preserves");
+    return;
+  }
+
+  if (scenario === "multi_attach_then_text_success") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("after files");
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "1.png", type: "image/png", size: 10, lastModified: 1 })
+      )
+    );
+    assert.ok(
+      api.selectComposerAttachment(
+        makeDocumentFile({ name: "2.pdf", size: 12, lastModified: 2 })
+      )
+    );
+    const n1 = api.getAttachmentDrafts()[0].nonce;
+    const n2 = api.getAttachmentDrafts()[1].nonce;
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "img1");
+    const textNonce = api.getSendAttemptNonce();
+    assert.ok(textNonce);
+    assert.notStrictEqual(n1, textNonce);
+    assert.notStrictEqual(n2, textNonce);
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.sendDocument.length >= 1, "doc2");
+    gate.sendDocument[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-2",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "text");
+    assert.strictEqual(gate.send[0].text, "after files");
+    assert.strictEqual(gate.send[0].client_nonce, textNonce);
+    const settle = settlePostSendRefresh();
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-T",
+      deduplicated: false,
+    });
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().attachmentCount, 0);
+    assert.strictEqual(api.getState().draft, "");
+    console.log("OK multi_attach_then_text_success");
+    return;
+  }
+
+  function dispatchDocumentKey(key, opts) {
+    const ev = {
+      key: key,
+      shiftKey: !!(opts && opts.shiftKey),
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    const list =
+      (sandbox.document._listeners && sandbox.document._listeners.keydown) || [];
+    list.forEach((fn) => fn(ev));
+    return ev;
+  }
+
+  function fireNode(node, type, ev) {
+    const list = (node && node._listeners && node._listeners[type]) || [];
+    list.forEach((fn) => fn(ev || { type: type, target: node, currentTarget: node, preventDefault() {} }));
+  }
+
+  if (scenario === "upload_modal_open_close_preserves_queue") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    const attach = root.querySelector(".oc-composer-attach");
+    assert.ok(attach);
+    attach.click();
+    assert.ok(api.isUploadModalOpen());
+    const modal = sandbox.document.querySelector("#oc-upload-modal");
+    assert.ok(modal);
+    assert.strictEqual(modal.getAttribute("dir"), "ltr");
+    assert.ok(sandbox.document.querySelector(".oc-upload-title"));
+    assert.ok(sandbox.document.querySelector(".oc-upload-dropzone"));
+    assert.ok(sandbox.document.querySelector(".oc-upload-file"));
+    assert.ok(sandbox.document.querySelector(".oc-upload-add"));
+    assert.strictEqual(
+      api.selectComposerAttachments([
+        makeImageFile({ name: "a.png", type: "image/png", size: 10, lastModified: 1 }),
+        makeDocumentFile({ name: "b.pdf", size: 20, lastModified: 2 }),
+      ]),
+      2
+    );
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.ok(sandbox.document.querySelector(".oc-upload-queue"));
+    assert.strictEqual(
+      sandbox.document.querySelectorAll(".oc-upload-queue-item").length,
+      2
+    );
+    sandbox.document.querySelector(".oc-upload-add").click();
+    assert.strictEqual(api.isUploadModalOpen(), false);
+    assert.strictEqual(api.getState().attachmentCount, 2, "closing preserves drafts");
+    assert.strictEqual(sandbox.document.activeElement, attach, "focus returns to +");
+    assert.ok(root.querySelector(".oc-composer-attachments"));
+    console.log("OK upload_modal_open_close_preserves_queue");
+    return;
+  }
+
+  if (scenario === "upload_modal_library_stub_and_device_drop") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.openUploadModal(root.querySelector(".oc-composer-attach")));
+    const tabs = sandbox.document.querySelectorAll(".oc-upload-tab");
+    assert.strictEqual(tabs.length, 2);
+    tabs[1].click();
+    await waitUntil(() => gate.libraryList.length >= 1, "library list");
+    gate.libraryList[0].d.resolve({
+      items: [],
+      has_more: false,
+      next_offset: null,
+      limit: 20,
+      offset: 0,
+    });
+    await waitUntil(() => api.getLibraryState().loading === false, "library idle");
+    assert.ok(sandbox.document.querySelector(".oc-upload-library-search"));
+    assert.ok(sandbox.document.querySelector(".oc-upload-library-empty"));
+    assert.ok(!sandbox.document.querySelector(".oc-upload-file"), "no device picker on Library");
+    assert.ok(!sandbox.document.querySelector(".oc-upload-dropzone"));
+    sandbox.document.querySelectorAll(".oc-upload-tab")[0].click();
+    const drop = sandbox.document.querySelector(".oc-upload-dropzone");
+    assert.ok(drop);
+    fireNode(drop, "drop", {
+      type: "drop",
+      preventDefault() {},
+      dataTransfer: {
+        files: [
+          makeImageFile({ name: "drop.png", type: "image/png", size: 15, lastModified: 7 }),
+          makeDocumentFile({ name: "drop.pdf", size: 25, lastModified: 8 }),
+        ],
+      },
+    });
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.strictEqual(
+      sandbox.document.querySelectorAll(".oc-upload-queue-item").length,
+      2
+    );
+    const input = sandbox.document.querySelector(".oc-upload-file");
+    assert.ok(input);
+    assert.ok(input.getAttribute("multiple") != null, "multi-select enabled");
+    input.files = [
+      makeImageFile({ name: "pick.png", type: "image/png", size: 16, lastModified: 9 }),
+    ];
+    fireNode(input, "change", { type: "change", target: input });
+    assert.strictEqual(api.getState().attachmentCount, 3);
+    sandbox.document.querySelector(".oc-upload-close").click();
+    assert.strictEqual(api.isUploadModalOpen(), false);
+    assert.strictEqual(api.getState().attachmentCount, 3);
+    console.log("OK upload_modal_library_stub_and_device_drop");
+    return;
+  }
+
+  if (scenario === "library_search_pagination_and_stale") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.openUploadModal(root.querySelector(".oc-composer-attach")));
+    sandbox.document.querySelectorAll(".oc-upload-tab")[1].click();
+    await waitUntil(() => gate.libraryList.length >= 1, "library page1");
+    assert.strictEqual(gate.libraryList[0].offset, "0");
+    gate.libraryList[0].d.resolve({
+      items: [
+        {
+          name: "FILE-1",
+          file_name: "one.png",
+          file_size: 10,
+          kind: "image",
+          content_type: "image/png",
+          is_private: true,
+          file_url: "/private/files/leak.png",
+        },
+      ],
+      has_more: true,
+      next_offset: 20,
+      limit: 20,
+      offset: 0,
+    });
+    await waitUntil(() => api.getLibraryState().items.length === 1, "page1 items");
+    assert.ok(!api.getLibraryState().items[0].file_url, "no private URL in client state");
+    assert.ok(sandbox.document.querySelector(".oc-upload-library-more"));
+    assert.ok(!String(JSON.stringify(api.getLibraryState().items)).includes("/private/files"));
+
+    // Stale search: start page1-for-new-search while older load-more is pending.
+    const pMore = api.fetchLibraryPage({ append: true });
+    await waitUntil(() => gate.libraryList.length >= 2, "load more");
+    assert.strictEqual(gate.libraryList[1].offset, "20");
+    const searchInput = sandbox.document.querySelector(".oc-upload-library-search");
+    searchInput.value = "quote";
+    fireNode(searchInput, "input", { type: "input", target: searchInput });
+    await sleep(320);
+    await waitUntil(() => gate.libraryList.length >= 3, "search list");
+    assert.strictEqual(gate.libraryList[2].search, "quote");
+    assert.strictEqual(gate.libraryList[2].offset, "0");
+    // Resolve stale load-more after search started — must not overwrite search results.
+    gate.libraryList[1].d.resolve({
+      items: [
+        {
+          name: "FILE-STALE",
+          file_name: "stale.png",
+          file_size: 11,
+          kind: "image",
+          content_type: "image/png",
+          is_private: true,
+        },
+      ],
+      has_more: false,
+      next_offset: null,
+    });
+    gate.libraryList[2].d.resolve({
+      items: [
+        {
+          name: "FILE-2",
+          file_name: "quote.pdf",
+          file_size: 22,
+          kind: "document",
+          content_type: "application/pdf",
+          is_private: true,
+        },
+      ],
+      has_more: false,
+      next_offset: null,
+    });
+    await pMore;
+    await waitUntil(() => api.getLibraryState().loading === false, "search settled");
+    assert.strictEqual(api.getLibraryState().items.length, 1);
+    assert.strictEqual(api.getLibraryState().items[0].name, "FILE-2");
+    assert.ok(!api.getLibraryState().hasMore);
+    console.log("OK library_search_pagination_and_stale");
+    return;
+  }
+
+  if (scenario === "library_permission_error_state") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    assert.ok(api.openUploadModal(root.querySelector(".oc-composer-attach")));
+    sandbox.document.querySelectorAll(".oc-upload-tab")[1].click();
+    await waitUntil(() => gate.libraryList.length >= 1, "library deny");
+    gate.libraryList[0].d.reject(new Error("Not permitted"));
+    await waitUntil(() => !!api.getLibraryState().error, "library error");
+    assert.ok(/not permitted/i.test(api.getLibraryState().error || ""));
+    assert.ok(sandbox.document.querySelector(".oc-upload-library-status.is-error"));
+    assert.strictEqual(api.getLibraryState().items.length, 0);
+    console.log("OK library_permission_error_state");
+    return;
+  }
+
+  if (scenario === "library_mixed_queue_send_and_nonces") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("after mix");
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "device.png", type: "image/png", size: 10, lastModified: 1 })
+      )
+    );
+    assert.ok(
+      api.selectLibraryAttachment({
+        name: "FILE-LIB",
+        file_name: "lib.pdf",
+        file_size: 20,
+        kind: "document",
+        content_type: "application/pdf",
+        is_private: true,
+        file_url: "/private/files/lib.pdf",
+      })
+    );
+    const drafts = api.getAttachmentDrafts();
+    assert.strictEqual(drafts.length, 2);
+    assert.strictEqual(drafts[0].source, "device");
+    assert.strictEqual(drafts[1].source, "library");
+    assert.strictEqual(drafts[1].libraryName, "FILE-LIB");
+    assert.ok(drafts[1].hasFile);
+    assert.ok(!drafts[1].previewUrl, "library never previews private URL");
+    const n1 = drafts[0].nonce;
+    const n2 = drafts[1].nonce;
+    assert.ok(n1 && n2);
+    assert.notStrictEqual(n1, n2);
+    // Re-select same library file is duplicate — nonce preserved.
+    assert.ok(
+      api.selectLibraryAttachment({
+        name: "FILE-LIB",
+        file_name: "lib.pdf",
+        file_size: 20,
+        kind: "document",
+        content_type: "application/pdf",
+      })
+    );
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.strictEqual(api.getAttachmentDrafts()[1].nonce, n2);
+
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "device first");
+    assert.strictEqual(gate.sendImage[0].client_nonce, n1);
+    assert.strictEqual(gate.sendImageFromFile.length, 0, "library waits");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-1",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.sendDocumentFromFile.length >= 1, "library second");
+    assert.strictEqual(gate.sendDocumentFromFile[0].file, "FILE-LIB");
+    assert.strictEqual(gate.sendDocumentFromFile[0].client_nonce, n2);
+    assert.strictEqual(gate.send.length, 0);
+    const settle = settlePostSendRefresh();
+    gate.sendDocumentFromFile[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-2",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.send.length >= 1, "text after files");
+    assert.strictEqual(gate.send[0].text, "after mix");
+    gate.send[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-3",
+      deduplicated: false,
+    });
+    await p;
+    await settle;
+    assert.strictEqual(api.getState().attachmentCount, 0);
+    assert.strictEqual(api.getState().draft, "");
+    console.log("OK library_mixed_queue_send_and_nonces");
+    return;
+  }
+
+  if (scenario === "library_failed_stops_and_preserves") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("keep text");
+    assert.ok(
+      api.selectLibraryAttachment({
+        name: "FILE-A",
+        file_name: "a.png",
+        file_size: 10,
+        kind: "image",
+        content_type: "image/png",
+      })
+    );
+    assert.ok(
+      api.selectLibraryAttachment({
+        name: "FILE-B",
+        file_name: "b.pdf",
+        file_size: 11,
+        kind: "document",
+        content_type: "application/pdf",
+      })
+    );
+    const n1 = api.getAttachmentDrafts()[0].nonce;
+    const n2 = api.getAttachmentDrafts()[1].nonce;
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImageFromFile.length >= 1, "lib fail first");
+    gate.sendImageFromFile[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(gate.sendDocumentFromFile.length, 0, "stopped after failure");
+    assert.strictEqual(gate.send.length, 0);
+    assert.strictEqual(api.getState().attachmentCount, 2);
+    assert.strictEqual(api.getAttachmentDrafts()[0].nonce, n1);
+    assert.strictEqual(api.getAttachmentDrafts()[1].nonce, n2);
+    assert.strictEqual(api.getState().draft, "keep text");
+    console.log("OK library_failed_stops_and_preserves");
+    return;
+  }
+
+  if (scenario === "library_unknown_blocks_and_preserves") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    api.setDraft("maybe later");
+    assert.ok(
+      api.selectComposerAttachment(
+        makeImageFile({ name: "d.png", type: "image/png", size: 9, lastModified: 3 })
+      )
+    );
+    assert.ok(
+      api.selectLibraryAttachment({
+        name: "FILE-U",
+        file_name: "u.pdf",
+        file_size: 12,
+        kind: "document",
+        content_type: "application/pdf",
+      })
+    );
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "device first");
+    gate.sendImage[0].d.resolve({
+      ok: true,
+      uncertain: false,
+      delivery_status: "Sent",
+      message: "MSG-D",
+      deduplicated: false,
+    });
+    await waitUntil(() => gate.sendDocumentFromFile.length >= 1, "library unknown");
+    gate.sendDocumentFromFile[0].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await p;
+    await waitUntil(() => api.getState().sending === false, "idle");
+    assert.strictEqual(gate.send.length, 0);
+    assert.strictEqual(api.getState().attachmentCount, 1);
+    assert.ok(api.getAttachmentDrafts()[0].blockResend);
+    assert.strictEqual(api.getAttachmentDrafts()[0].source, "library");
+    assert.ok(String(api.getState().error || "").toLowerCase().indexOf("unconfirmed") >= 0);
+    assert.strictEqual(api.getState().canSend, false);
+    await api.sendComposer();
+    assert.strictEqual(gate.sendDocumentFromFile.length, 1, "no auto retry");
+    console.log("OK library_unknown_blocks_and_preserves");
+    return;
+  }
+
+  if (scenario === "upload_modal_escape_and_focus_trap") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(row, []);
+    const attach = root.querySelector(".oc-composer-attach");
+    assert.ok(api.openUploadModal(attach));
+    const modal = sandbox.document.querySelector("#oc-upload-modal");
+    assert.ok(modal);
+    const focusables = Array.prototype.slice
+      .call(modal.querySelectorAll("button, input, [tabindex]"))
+      .filter((node) => {
+        if (!node || node.disabled) return false;
+        const cls = " " + String(node.className || "") + " ";
+        if (cls.indexOf(" oc-upload-file ") >= 0) return false;
+        if (node.getAttribute("tabindex") === "-1") return false;
+        if (node.getAttribute("aria-hidden") === "true") return false;
+        return true;
+      });
+    assert.ok(focusables.length >= 3, "modal has focusable controls");
+    assert.strictEqual(sandbox.document.activeElement, focusables[0]);
+    sandbox.document.activeElement = focusables[focusables.length - 1];
+    dispatchDocumentKey("Tab", { shiftKey: false });
+    assert.strictEqual(sandbox.document.activeElement, focusables[0], "Tab wraps to first");
+    sandbox.document.activeElement = focusables[0];
+    dispatchDocumentKey("Tab", { shiftKey: true });
+    assert.strictEqual(
+      sandbox.document.activeElement,
+      focusables[focusables.length - 1],
+      "Shift+Tab wraps to last"
+    );
+    dispatchDocumentKey("Escape");
+    assert.strictEqual(api.isUploadModalOpen(), false);
+    assert.strictEqual(sandbox.document.activeElement, attach);
+    console.log("OK upload_modal_escape_and_focus_trap");
     return;
   }
 
@@ -3687,6 +4547,58 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_document_switch_conversation_ignores_stale(self):
 		out = self._run_scenario("document_switch_conversation_ignores_stale")
 		self.assertIn("OK document_switch_conversation_ignores_stale", out)
+
+	def test_multi_attach_queue_preview_and_cap(self):
+		out = self._run_scenario("multi_attach_queue_preview_and_cap")
+		self.assertIn("OK multi_attach_queue_preview_and_cap", out)
+
+	def test_multi_attach_sequential_send(self):
+		out = self._run_scenario("multi_attach_sequential_send")
+		self.assertIn("OK multi_attach_sequential_send", out)
+
+	def test_multi_attach_failed_stops_and_preserves(self):
+		out = self._run_scenario("multi_attach_failed_stops_and_preserves")
+		self.assertIn("OK multi_attach_failed_stops_and_preserves", out)
+
+	def test_multi_attach_unknown_blocks_and_preserves(self):
+		out = self._run_scenario("multi_attach_unknown_blocks_and_preserves")
+		self.assertIn("OK multi_attach_unknown_blocks_and_preserves", out)
+
+	def test_multi_attach_then_text_success(self):
+		out = self._run_scenario("multi_attach_then_text_success")
+		self.assertIn("OK multi_attach_then_text_success", out)
+
+	def test_upload_modal_open_close_preserves_queue(self):
+		out = self._run_scenario("upload_modal_open_close_preserves_queue")
+		self.assertIn("OK upload_modal_open_close_preserves_queue", out)
+
+	def test_upload_modal_library_stub_and_device_drop(self):
+		out = self._run_scenario("upload_modal_library_stub_and_device_drop")
+		self.assertIn("OK upload_modal_library_stub_and_device_drop", out)
+
+	def test_library_search_pagination_and_stale(self):
+		out = self._run_scenario("library_search_pagination_and_stale")
+		self.assertIn("OK library_search_pagination_and_stale", out)
+
+	def test_library_permission_error_state(self):
+		out = self._run_scenario("library_permission_error_state")
+		self.assertIn("OK library_permission_error_state", out)
+
+	def test_library_mixed_queue_send_and_nonces(self):
+		out = self._run_scenario("library_mixed_queue_send_and_nonces")
+		self.assertIn("OK library_mixed_queue_send_and_nonces", out)
+
+	def test_library_failed_stops_and_preserves(self):
+		out = self._run_scenario("library_failed_stops_and_preserves")
+		self.assertIn("OK library_failed_stops_and_preserves", out)
+
+	def test_library_unknown_blocks_and_preserves(self):
+		out = self._run_scenario("library_unknown_blocks_and_preserves")
+		self.assertIn("OK library_unknown_blocks_and_preserves", out)
+
+	def test_upload_modal_escape_and_focus_trap(self):
+		out = self._run_scenario("upload_modal_escape_and_focus_trap")
+		self.assertIn("OK upload_modal_escape_and_focus_trap", out)
 
 	def test_combined_switch_during_image_defers_text(self):
 		out = self._run_scenario("combined_switch_during_image_defers_text")
