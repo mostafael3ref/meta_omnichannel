@@ -1874,6 +1874,36 @@
     await softRefreshMessages(pending);
   }
 
+  const MESSAGE_PAGE_SIZE = 100;
+
+  /**
+   * Load the latest message window for a conversation.
+   * ``list_messages`` is oldest-first; offset 0 alone truncates the tip once
+   * ``total > limit`` (e.g. a 5-file send on a ~100-message thread would only
+   * keep the first new attachment). When ``has_more``, fetch the tail page.
+   */
+  async function fetchLatestMessagePage(conversationName) {
+    const limit = MESSAGE_PAGE_SIZE;
+    const head = await call("meta_omnichannel.api.inbox.list_messages", {
+      conversation: conversationName,
+      limit: limit,
+      offset: 0,
+    });
+    if (!head) return { items: [], total: 0, conversation: null };
+    const total = Number(head.total);
+    const headCount = ((head.items && head.items.length) || 0);
+    if (!head.has_more || !(total > limit) || headCount >= total) {
+      return head;
+    }
+    const offset = Math.max(0, total - limit);
+    const tip = await call("meta_omnichannel.api.inbox.list_messages", {
+      conversation: conversationName,
+      limit: limit,
+      offset: offset,
+    });
+    return tip || head;
+  }
+
   /** Refresh messages for the active thread only — never reloads customer panel. */
   async function softRefreshMessages(conversationName) {
     if (!conversationName || !state.selected || state.selected.name !== conversationName) return;
@@ -1885,11 +1915,7 @@
     const gen = ++messagesRefreshGen;
     const selectedName = conversationName;
     try {
-      const msgData = await call("meta_omnichannel.api.inbox.list_messages", {
-        conversation: selectedName,
-        limit: 100,
-        offset: 0,
-      });
+      const msgData = await fetchLatestMessagePage(selectedName);
       if (gen !== messagesRefreshGen) return;
       if (!state.selected || state.selected.name !== selectedName) return;
       state.messages = (msgData && msgData.items) || [];
@@ -1950,11 +1976,7 @@
       // Load messages independently of the customer panel so a panel failure
       // cannot leave .oc-messages empty after a successful list_messages call.
       try {
-        const msgData = await call("meta_omnichannel.api.inbox.list_messages", {
-          conversation: row.name,
-          limit: 100,
-          offset: 0,
-        });
+        const msgData = await fetchLatestMessagePage(row.name);
         if (seq !== openConversationSeq || openGen !== messagesRefreshGen) return;
         if (!state.selected || state.selected.name !== row.name) return;
         state.messages = (msgData && msgData.items) || [];
@@ -2606,7 +2628,9 @@
             "aria-label": t("attach_image"),
             disabled: !canCompose,
             onclick: (ev) => {
-              if (!canCompose) return;
+              // Must re-check live state: finishSending may unlock via
+              // syncComposerControls without rebuilding this handler closure.
+              if (!composerCanCompose()) return;
               openUploadModal(ev && ev.currentTarget);
             },
           })

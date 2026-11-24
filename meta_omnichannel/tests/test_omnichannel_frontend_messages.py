@@ -686,7 +686,7 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		start = js.index("async function softRefreshMessages")
 		end = js.index("async function openConversation")
 		soft = js[start:end]
-		self.assertIn("list_messages", soft)
+		self.assertIn("fetchLatestMessagePage", soft)
 		self.assertNotIn("get_customer_panel", soft)
 		self.assertNotIn("openConversation(", soft)
 		self.assertNotIn("mark_conversation_read", soft)
@@ -696,6 +696,24 @@ class TestRealtimeSoftRefreshWiring(unittest.TestCase):
 		self.assertIn("pendingSoftMessageRefresh", soft)
 		self.assertIn("async function refreshAfterSend", soft)
 		self.assertIn("softRefreshMessages(conversationName)", soft)
+
+	def test_attach_onclick_uses_live_composer_can_compose(self):
+		"""finishSending syncs disabled without rebuilding onclick — must re-check live."""
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		marker = 'className: "oc-btn secondary oc-composer-attach"'
+		attach_idx = js.index(marker)
+		snippet = js[attach_idx : attach_idx + 450]
+		self.assertIn("composerCanCompose()", snippet)
+		self.assertNotIn("if (!canCompose) return", snippet)
+
+	def test_fetch_latest_message_page_loads_tip_when_has_more(self):
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		start = js.index("async function fetchLatestMessagePage")
+		end = js.index("async function softRefreshMessages")
+		body = js[start:end]
+		self.assertIn("has_more", body)
+		self.assertIn("total - limit", body)
+		self.assertIn("MESSAGE_PAGE_SIZE", body)
 
 		flush_start = js.index("async function flushRealtimeRefresh")
 		flush_end = js.index("function scheduleRealtimeRefresh")
@@ -1403,10 +1421,28 @@ const sandbox = {
       return { ok: true, json: async () => ({ message: { items } }) };
     }
     if (path.indexOf("list_messages") !== -1) {
-      const entry = { conversation: params.get("conversation"), d: defer() };
+      const entry = {
+        conversation: params.get("conversation"),
+        limit: Number(params.get("limit") || 0) || 100,
+        offset: Number(params.get("offset") || 0) || 0,
+        d: defer(),
+      };
       gate.messages.push(entry);
-      const items = await entry.d;
-      return { ok: true, json: async () => ({ message: { items } }) };
+      const payload = await entry.d;
+      // Arrays keep legacy harness callers; page objects pass tip/total/has_more through.
+      if (Array.isArray(payload)) {
+        return {
+          ok: true,
+          json: async () => ({
+            message: {
+              items: payload,
+              total: payload.length,
+              has_more: false,
+            },
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({ message: payload }) };
     }
     if (path.indexOf("get_customer_panel") !== -1) {
       const entry = { conversation: params.get("conversation"), d: defer() };
@@ -3195,6 +3231,233 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "five_attach_batch_shows_all_and_reopens_plus") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    // Open empty — tip pagination is asserted on the post-send soft refresh.
+    await openReadyConversation(row, []);
+    for (let i = 0; i < 5; i++) {
+      assert.ok(
+        api.selectComposerAttachment(
+          makeImageFile({
+            name: "f" + i + ".png",
+            type: "image/png",
+            size: 10 + i,
+            lastModified: 10 + i,
+          })
+        )
+      );
+    }
+    assert.strictEqual(api.getState().attachmentCount, 5);
+    const tipItems = [0, 1, 2, 3, 4].map((i) => ({
+      name: "MSG-F" + i,
+      direction: "Outbound",
+      message_type: "Image",
+      text_content: "",
+      attachment_url: "https://cdn.example/f" + i + ".png",
+      attachment_file_url: "/private/files/f" + i + ".png",
+      sent_at: String(100 + i),
+    }));
+    const p = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "img0", 200);
+    assert.strictEqual(api.getState().sending, true);
+    assert.strictEqual(root.querySelector(".oc-composer-attach").disabled, true);
+    for (let i = 0; i < 5; i++) {
+      await waitUntil(() => gate.sendImage.length >= i + 1, "img" + i, 200);
+      gate.sendImage[i].d.resolve({
+        ok: true,
+        uncertain: false,
+        delivery_status: "Sent",
+        message: "MSG-F" + i,
+        deduplicated: false,
+      });
+    }
+    // Drive tip-aware soft refresh + list settle (same pattern as settlePostSendRefresh).
+    let tipResolved = false;
+    for (let i = 0; i < 400; i++) {
+      for (const entry of gate.messages) {
+        if (entry.d.isSettled()) continue;
+        if ((entry.offset || 0) === 0) {
+          // Oldest page: has_more + total>limit forces tip fetch; omit the five new files.
+          entry.d.resolve({
+            items: [
+              {
+                name: "m-old-0",
+                direction: "Inbound",
+                message_type: "Text",
+                text_content: "oldest",
+                sent_at: "0",
+              },
+            ],
+            total: 105,
+            has_more: true,
+            conversation: { unread_count: 0 },
+          });
+        } else {
+          assert.strictEqual(entry.offset, 5, "tip offset = total - limit");
+          entry.d.resolve({
+            items: tipItems,
+            total: 105,
+            has_more: false,
+            conversation: { unread_count: 0 },
+          });
+          tipResolved = true;
+        }
+      }
+      for (const entry of gate.list) {
+        if (!entry.d.isSettled()) entry.d.resolve(bootItems);
+      }
+      if (api.getState().sending === false && tipResolved) break;
+      await sleep(10);
+    }
+    await p;
+    assert.ok(tipResolved, "tip page must be fetched");
+    assert.strictEqual(api.getState().sending, false);
+    assert.strictEqual(api.getState().attachmentCount, 0);
+    assert.strictEqual(api.getState().messageCount, 5, "tip page shows all five");
+    const mediaSrcs = Array.from(root.querySelectorAll(".oc-attach-media")).map(
+      (n) => n.getAttribute("src") || ""
+    );
+    assert.strictEqual(mediaSrcs.length, 5, "all five attachments rendered");
+    for (let i = 0; i < 5; i++) {
+      const needle = "f" + i + ".png";
+      assert.ok(
+        mediaSrcs.some((u) => String(u).indexOf(needle) >= 0),
+        "attachment " + needle + " visible"
+      );
+    }
+    // + must reopen without a full page refresh (live canCompose, not stale closure).
+    const attachAfter = root.querySelector(".oc-composer-attach");
+    assert.ok(attachAfter);
+    assert.strictEqual(attachAfter.disabled, false);
+    assert.strictEqual(api.getState().canCompose, true);
+    attachAfter.click();
+    assert.strictEqual(api.isUploadModalOpen(), true, "+ reopens modal after batch");
+    sandbox.document.querySelector(".oc-upload-add").click();
+    assert.strictEqual(api.isUploadModalOpen(), false);
+    console.log("OK five_attach_batch_shows_all_and_reopens_plus");
+    return;
+  }
+
+  if (scenario === "five_attach_failed_unknown_and_switch") {
+    const rowA = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const rowB = {
+      name: "CONV-B",
+      participant_name: "B",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    await openReadyConversation(rowA, []);
+    for (let i = 0; i < 5; i++) {
+      assert.ok(
+        api.selectComposerAttachment(
+          makeImageFile({
+            name: "x" + i + ".png",
+            type: "image/png",
+            size: 10 + i,
+            lastModified: 20 + i,
+          })
+        )
+      );
+    }
+    const nonces = api.getAttachmentDrafts().map((d) => d.nonce);
+    const pFail = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 1, "fail first");
+    gate.sendImage[0].d.resolve({
+      ok: false,
+      uncertain: false,
+      delivery_status: "Failed",
+      error: "page not allowed",
+      deduplicated: false,
+    });
+    await pFail;
+    await waitUntil(() => api.getState().sending === false, "idle after fail");
+    assert.strictEqual(gate.sendImage.length, 1, "stopped after Failed");
+    assert.strictEqual(api.getState().attachmentCount, 5, "Failed preserves queue");
+    assert.deepStrictEqual(
+      api.getAttachmentDrafts().map((d) => d.nonce),
+      nonces
+    );
+    const attachFail = root.querySelector(".oc-composer-attach");
+    assert.strictEqual(attachFail.disabled, false);
+    attachFail.click();
+    assert.strictEqual(api.isUploadModalOpen(), true, "+ works after Failed");
+    sandbox.document.querySelector(".oc-upload-add").click();
+
+    // Unknown on a fresh attempt for the same queue.
+    const pUnk = api.sendComposer();
+    await waitUntil(() => gate.sendImage.length >= 2, "unknown first");
+    gate.sendImage[1].d.resolve({
+      ok: false,
+      uncertain: true,
+      delivery_status: "Unknown",
+      error: "timeout",
+      deduplicated: false,
+    });
+    await pUnk;
+    await waitUntil(() => api.getState().sending === false, "idle after unknown");
+    assert.strictEqual(gate.sendImage.length, 2, "no further sends after Unknown");
+    assert.strictEqual(api.getState().attachmentCount, 5);
+    assert.ok(api.getAttachmentDrafts()[0].blockResend);
+    assert.strictEqual(api.getState().canSend, false);
+    const attachUnk = root.querySelector(".oc-composer-attach");
+    assert.strictEqual(attachUnk.disabled, false);
+    attachUnk.click();
+    assert.strictEqual(api.isUploadModalOpen(), true, "+ works after Unknown");
+    sandbox.document.querySelector(".oc-upload-add").click();
+
+    // Conversation switch must not auto-resend or clear the protected draft.
+    const bootTwo = [
+      rowA,
+      rowB,
+    ];
+    for (const entry of gate.list) {
+      if (!entry.d.isSettled()) entry.d.resolve(bootTwo);
+    }
+    const msgBefore = gate.messages.length;
+    const panelBefore = gate.panel.length;
+    const openB = api.openConversation(rowB);
+    await waitUntil(() => gate.messages.length > msgBefore, "open B");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBefore, "panel B");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openB;
+    assert.strictEqual(api.getState().selected, "CONV-B");
+    assert.strictEqual(gate.sendImage.length, 2, "no send on switch");
+
+    const msgBeforeA = gate.messages.length;
+    const panelBeforeA = gate.panel.length;
+    const openA = api.openConversation(rowA);
+    await waitUntil(() => gate.messages.length > msgBeforeA, "reopen A");
+    gate.messages[gate.messages.length - 1].d.resolve([]);
+    await waitUntil(() => gate.panel.length > panelBeforeA, "panel A");
+    gate.panel[gate.panel.length - 1].d.resolve({ lead: null, notes: [] });
+    await openA;
+    assert.strictEqual(api.getState().selected, "CONV-A");
+    assert.strictEqual(api.getState().attachmentCount, 5, "drafts restored after switch");
+    assert.ok(api.getAttachmentDrafts()[0].blockResend, "Unknown protection kept");
+    assert.strictEqual(gate.sendImage.length, 2, "no auto-resend on reopen");
+    const attachBack = root.querySelector(".oc-composer-attach");
+    assert.strictEqual(attachBack.disabled, false);
+    attachBack.click();
+    assert.strictEqual(api.isUploadModalOpen(), true);
+    sandbox.document.querySelector(".oc-upload-add").click();
+    console.log("OK five_attach_failed_unknown_and_switch");
+    return;
+  }
+
   function dispatchDocumentKey(key, opts) {
     const ev = {
       key: key,
@@ -4567,6 +4830,14 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_multi_attach_then_text_success(self):
 		out = self._run_scenario("multi_attach_then_text_success")
 		self.assertIn("OK multi_attach_then_text_success", out)
+
+	def test_five_attach_batch_shows_all_and_reopens_plus(self):
+		out = self._run_scenario("five_attach_batch_shows_all_and_reopens_plus")
+		self.assertIn("OK five_attach_batch_shows_all_and_reopens_plus", out)
+
+	def test_five_attach_failed_unknown_and_switch(self):
+		out = self._run_scenario("five_attach_failed_unknown_and_switch")
+		self.assertIn("OK five_attach_failed_unknown_and_switch", out)
 
 	def test_upload_modal_open_close_preserves_queue(self):
 		out = self._run_scenario("upload_modal_open_close_preserves_queue")
