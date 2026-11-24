@@ -165,16 +165,37 @@
 
   /**
    * Trusted same-origin private File path only.
-   * Rejects protocol-relative, traversal, schemes, and untrusted relative paths.
+   * Allows historical Unicode / spaced basenames (Arabic PDF titles); Open links
+   * go through download_file + encodeURIComponent. Rejects traversal, backslash,
+   * control chars, query injection, and percent-encoded path tricks.
    */
   function safePrivateFilePath(raw) {
+    const PREFIX = "/private/files/";
     const s = String(raw || "").trim();
-    if (!s || !s.startsWith("/private/files/")) return null;
-    if (s.startsWith("//")) return null;
-    if (s.includes("..") || s.includes("\\") || s.includes("\0")) return null;
-    if (/\s/.test(s)) return null;
-    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return null;
-    return s;
+    if (!s || !s.startsWith(PREFIX)) return null;
+    if (s.startsWith("//") || s.includes("\\") || s.includes("\0")) return null;
+    let decoded = s;
+    for (let i = 0; i < 3; i++) {
+      try {
+        const nxt = decodeURIComponent(decoded);
+        if (nxt === decoded) break;
+        decoded = nxt;
+      } catch (_) {
+        return null;
+      }
+    }
+    if (!decoded.startsWith(PREFIX) || decoded.startsWith("//")) return null;
+    if (decoded.includes("\\") || decoded.includes("\0") || decoded.includes("..")) return null;
+    if (decoded.includes("?")) return null;
+    if (/[\x00-\x1f\x7f]/.test(decoded)) return null;
+    const rest = decoded.slice(PREFIX.length);
+    if (!rest) return null;
+    if (rest.indexOf("://") >= 0 || rest.toLowerCase().indexOf("javascript:") === 0) return null;
+    const parts = rest.split("/");
+    for (let i = 0; i < parts.length; i++) {
+      if (!parts[i] || parts[i] === "." || parts[i] === "..") return null;
+    }
+    return decoded;
   }
 
   /** Prefer private File paths or https CDN — never javascript:/data:/http:. */

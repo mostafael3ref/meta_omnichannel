@@ -371,6 +371,32 @@ class TestSafeHttpsUrlContract(unittest.TestCase):
 			"https://cdn.example/a.jpg",
 		)
 
+	def test_private_paths_accept_unicode_spaces_and_encode_download(self):
+		from urllib.parse import parse_qs, unquote, urlparse
+
+		from meta_omnichannel.tests._attachment_url_contract import (
+			attachment_download_href,
+			safe_private_file_path,
+		)
+
+		arabic = "/private/files/تقرير المبيعات.pdf"
+		self.assertEqual(safe_private_file_path(arabic), arabic)
+		self.assertEqual(
+			safe_private_file_path("/private/files/my report.pdf"),
+			"/private/files/my report.pdf",
+		)
+		self.assertEqual(
+			safe_attachment_url("/private/files/ok.jpg"),
+			"/private/files/ok.jpg",
+		)
+		href = attachment_download_href(arabic)
+		qs = parse_qs(urlparse(href).query)
+		self.assertEqual(unquote(qs["file_url"][0]), arabic)
+		js = PLAIN_JS.read_text(encoding="utf-8")
+		fn = js[js.index("function safePrivateFilePath") : js.index("function safeAttachmentUrl")]
+		self.assertIn("decodeURIComponent", fn)
+		self.assertNotIn("/\\s/.test(s)", fn)
+
 	def test_plain_js_and_vue_enforce_https(self):
 		js = PLAIN_JS.read_text(encoding="utf-8")
 		vue = VUE_APP.read_text(encoding="utf-8")
@@ -3464,6 +3490,52 @@ async function settleOpenListCalls(items) {
     return;
   }
 
+  if (scenario === "historical_arabic_pdf_open_link") {
+    const row = {
+      name: "CONV-A",
+      participant_name: "A",
+      provider: "Facebook",
+      status: "Open",
+      unread_count: 0,
+    };
+    const arabicPath = "/private/files/تقرير المبيعات.pdf";
+    await openReadyConversation(row, [
+      {
+        name: "MSG-AR",
+        direction: "Outbound",
+        message_type: "File",
+        text_content: "",
+        attachment_file_url: arabicPath,
+        attachment_url: null,
+        sent_at: "1",
+      },
+      {
+        name: "MSG-SP",
+        direction: "Outbound",
+        message_type: "File",
+        text_content: "",
+        attachment_file_url: "/private/files/my report.pdf",
+        attachment_url: null,
+        sent_at: "2",
+      },
+    ]);
+    const links = Array.from(root.querySelectorAll(".oc-attach-link"));
+    assert.strictEqual(links.length, 2, "both historical PDFs openable");
+    const hrefs = links.map((a) => a.getAttribute("href") || "");
+    hrefs.forEach((href) => {
+      assert.ok(href.indexOf("frappe.handler.download_file") >= 0, href);
+      assert.ok(href.indexOf("file_url=") >= 0, href);
+      assert.ok(!href.startsWith("/private/files/"), href);
+    });
+    assert.ok(hrefs.some((h) => h.indexOf("%20") >= 0 || decodeURIComponent(h).indexOf(" ") >= 0));
+    assert.ok(
+      hrefs.some((h) => decodeURIComponent(h).indexOf("تقرير المبيعات.pdf") >= 0),
+      "Arabic basename survives encoding"
+    );
+    console.log("OK historical_arabic_pdf_open_link");
+    return;
+  }
+
   if (scenario === "mixed_image_pdf_open_links") {
     const row = {
       name: "CONV-A",
@@ -5007,6 +5079,10 @@ class TestRealtimeConcurrencyNodeHarness(unittest.TestCase):
 	def test_five_attach_failed_unknown_and_switch(self):
 		out = self._run_scenario("five_attach_failed_unknown_and_switch")
 		self.assertIn("OK five_attach_failed_unknown_and_switch", out)
+
+	def test_historical_arabic_pdf_open_link(self):
+		out = self._run_scenario("historical_arabic_pdf_open_link")
+		self.assertIn("OK historical_arabic_pdf_open_link", out)
 
 	def test_mixed_image_pdf_open_links(self):
 		out = self._run_scenario("mixed_image_pdf_open_links")

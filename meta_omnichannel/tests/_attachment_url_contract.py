@@ -22,16 +22,48 @@ def safe_https_url(raw: object) -> str | None:
 	return s
 
 
+_PRIVATE_FILES_PREFIX = "/private/files/"
+
+
 def safe_private_file_path(raw: object) -> str | None:
-	"""Trusted same-origin ``/private/files/...`` only."""
+	"""Trusted same-origin ``/private/files/...`` only.
+
+	Allows Unicode / spaced basenames; rejects traversal and encoded path tricks.
+	Mirrors ``media._safe_private_file_url`` / Inbox ``safePrivateFilePath``.
+	"""
+	from urllib.parse import unquote
+
 	s = str(raw or "").strip()
-	if not s.startswith("/private/files/"):
+	if not s.startswith(_PRIVATE_FILES_PREFIX):
 		return None
-	if s.startswith("//") or ".." in s or "\\" in s or "\0" in s:
+	if s.startswith("//") or "\\" in s or "\0" in s:
 		return None
-	if any(ch.isspace() for ch in s):
+	decoded = s
+	try:
+		for _pass in range(3):
+			nxt = unquote(decoded)
+			if nxt == decoded:
+				break
+			decoded = nxt
+	except Exception:
 		return None
-	return s
+	if not decoded.startswith(_PRIVATE_FILES_PREFIX) or decoded.startswith("//"):
+		return None
+	if "\\" in decoded or "\0" in decoded or ".." in decoded or "?" in decoded:
+		return None
+	for ch in decoded:
+		code = ord(ch)
+		if code < 32 or code == 127:
+			return None
+	rest = decoded[len(_PRIVATE_FILES_PREFIX) :]
+	if not rest:
+		return None
+	if "://" in rest or rest.lower().startswith("javascript:"):
+		return None
+	parts = rest.split("/")
+	if any(part in ("", ".", "..") for part in parts):
+		return None
+	return decoded
 
 
 def safe_attachment_url(raw: object) -> str | None:

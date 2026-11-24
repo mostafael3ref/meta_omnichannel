@@ -228,11 +228,30 @@ class TestReadyAttachmentFileUrlHelper(unittest.TestCase):
 		self.assertIsNone(self.media._safe_private_file_url("/private/files/../etc/passwd"))
 		self.assertIsNone(self.media._safe_private_file_url("//evil.example/x"))
 		self.assertIsNone(self.media._safe_private_file_url("C:\\Windows\\x"))
-		self.assertIsNone(self.media._safe_private_file_url("/private/files/my report.pdf"))
 		self.assertIsNone(self.media._safe_private_file_url("/private/files/.._evil.pdf"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/foo?bar=1"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/foo%2f../etc/passwd"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/%2e%2e/%2e%2e/etc/passwd"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/%252e%252e/secret"))
+		self.assertIsNone(self.media._safe_private_file_url("/private/files/a\tb.pdf"))
 		self.assertEqual(
 			self.media._safe_private_file_url("/private/files/ok.jpg"),
 			"/private/files/ok.jpg",
+		)
+
+	def test_safe_private_file_url_accepts_unicode_and_spaces(self):
+		"""Historical Arabic / spaced PDF File URLs must open (no rename)."""
+		arabic = "/private/files/تقرير المبيعات.pdf"
+		spaced = "/private/files/my report.pdf"
+		hash_name = "/private/files/Invoice #1.pdf"
+		self.assertEqual(self.media._safe_private_file_url(arabic), arabic)
+		self.assertEqual(self.media._safe_private_file_url(spaced), spaced)
+		self.assertEqual(self.media._safe_private_file_url(hash_name), hash_name)
+		# Percent-encoded legitimate basename normalizes once for download_file.
+		self.assertEqual(
+			self.media._safe_private_file_url("/private/files/my%20report.pdf"),
+			"/private/files/my report.pdf",
 		)
 
 	def test_map_ready_does_not_truncate_when_extra_ready_rows(self):
@@ -310,6 +329,7 @@ class TestPreferredAttachmentUrlContract(unittest.TestCase):
 
 	def test_download_href_uses_frappe_api_for_private(self):
 		from meta_omnichannel.tests._attachment_url_contract import attachment_download_href
+		from urllib.parse import unquote
 
 		href = attachment_download_href("/private/files/omni_ok.jpg")
 		self.assertIn("frappe.handler.download_file", href)
@@ -318,6 +338,33 @@ class TestPreferredAttachmentUrlContract(unittest.TestCase):
 			attachment_download_href("https://cdn.example/a.jpg"),
 			"https://cdn.example/a.jpg",
 		)
+
+	def test_download_href_encodes_unicode_and_spaces(self):
+		from meta_omnichannel.tests._attachment_url_contract import (
+			attachment_download_href,
+			safe_private_file_path,
+		)
+		from urllib.parse import unquote
+
+		arabic = "/private/files/تقرير المبيعات.pdf"
+		self.assertEqual(safe_private_file_path(arabic), arabic)
+		href = attachment_download_href(arabic)
+		self.assertIsNotNone(href)
+		self.assertTrue(href.startswith("/api/method/frappe.handler.download_file?"))
+		raw_q = href.split("file_url=", 1)[1]
+		# Wire form must be percent-encoded (no raw space); round-trip restores path.
+		self.assertNotIn(" ", raw_q)
+		self.assertEqual(unquote(raw_q), arabic)
+		spaced = attachment_download_href("/private/files/my report.pdf")
+		self.assertIn("my%20report.pdf", spaced)
+
+	def test_contract_rejects_encoded_traversal(self):
+		from meta_omnichannel.tests._attachment_url_contract import safe_private_file_path
+
+		self.assertIsNone(safe_private_file_path("/private/files/%2e%2e/etc/passwd"))
+		self.assertIsNone(safe_private_file_path("/private/files/foo%2f..%2fbar"))
+		self.assertIsNone(safe_private_file_path("/private/files/%252e%252e/x"))
+		self.assertIsNone(safe_private_file_path("https://cdn.example/x.pdf"))
 
 
 if __name__ == "__main__":

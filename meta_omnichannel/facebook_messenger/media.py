@@ -532,16 +532,53 @@ def is_attachment_ready(message_name: str, attachment_index: int) -> bool:
 	)
 
 
+_PRIVATE_FILES_PREFIX = "/private/files/"
+
+
 def _safe_private_file_url(file_url: Any) -> str | None:
-	"""Return a trusted ``/private/files/...`` path only (never filesystem paths)."""
+	"""Return a trusted ``/private/files/...`` path only (never filesystem paths).
+
+	Accepts historical Unicode / spaced basenames (Arabic PDF titles, etc.).
+	Spaces are safe because Inbox Open links use ``download_file`` + encoding.
+	Rejects traversal, backslash, NUL/control chars, query injection, and
+	percent-encoded path manipulation (``%2e%2e``, ``%2f``, double-encoding).
+	"""
+	from urllib.parse import unquote
+
 	url = str(file_url or "").strip()
-	if not url.startswith("/private/files/"):
+	if not url.startswith(_PRIVATE_FILES_PREFIX):
 		return None
-	if url.startswith("//") or ".." in url or "\\" in url or "\0" in url:
+	if url.startswith("//") or "\\" in url or "\0" in url:
 		return None
-	if any(ch.isspace() for ch in url):
+
+	decoded = url
+	try:
+		for _pass in range(3):
+			nxt = unquote(decoded)
+			if nxt == decoded:
+				break
+			decoded = nxt
+	except Exception:
 		return None
-	return url
+
+	if not decoded.startswith(_PRIVATE_FILES_PREFIX) or decoded.startswith("//"):
+		return None
+	if "\\" in decoded or "\0" in decoded or ".." in decoded or "?" in decoded:
+		return None
+	for ch in decoded:
+		code = ord(ch)
+		if code < 32 or code == 127:
+			return None
+
+	rest = decoded[len(_PRIVATE_FILES_PREFIX) :]
+	if not rest:
+		return None
+	if "://" in rest or rest.lower().startswith("javascript:"):
+		return None
+	parts = rest.split("/")
+	if any(part in ("", ".", "..") for part in parts):
+		return None
+	return decoded
 
 
 def get_ready_attachment_file_url(
@@ -798,11 +835,9 @@ def _attach_outbound_bytes_file(
 	Does not call the Connector or commit/rollback. Reuses an existing Ready File
 	with the same content hash. Never returns ``file_url``.
 
-	Disk names always use ``_safe_filename`` (never the original upload basename).
-	Original names with spaces / ``#`` / ``..`` would produce File URLs that
-	``_safe_private_file_url`` rejects or that break raw Open hrefs — images
-	already used the safe stem; documents must match so mixed batches keep a
-	working ``attachment_file_url``.
+	Disk names always use ``_safe_filename`` (never the original upload basename)
+	so new outbound Files stay ASCII-safe. Historical Unicode/spaced File URLs
+	are still served via ``_safe_private_file_url`` + ``download_file``.
 	"""
 	message_name = (message_name or "").strip()
 	index = _parse_attachment_index(attachment_index)
