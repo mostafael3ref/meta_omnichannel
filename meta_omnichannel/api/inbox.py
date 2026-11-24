@@ -912,16 +912,27 @@ def sync_inbox(limit: int = 50) -> dict:
 
 @frappe.whitelist()
 def sync_conversation(conversation: str) -> dict:
+	"""Per-conversation message sync for providers with a confirmed history API.
+
+	Facebook and Instagram reuse the same permission gates. Instagram returns
+	inserted/duplicate/partial counts from ``sync_instagram_conversation_messages``
+	(bounded pagination). WhatsApp remains ``pending_contract``. No outbound sends.
+	"""
 	ensure_omnichannel_agent()
 	conv = frappe.get_doc("Omnichannel Conversation", conversation)
 	if not has_conversation_permission(conv, "write"):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
-	if conv.provider != "Facebook":
-		return {
-			"ok": False,
-			"error": f"{conv.provider} sync requires a confirmed connector API",
-			"pending_contract": True,
-		}
-	from meta_omnichannel.facebook_messenger.sync import sync_conversation_messages
+	if conv.provider == "Facebook":
+		from meta_omnichannel.facebook_messenger.sync import sync_conversation_messages
 
-	return sync_conversation_messages(conversation)
+		return sync_conversation_messages(conversation)
+	if conv.provider == "Instagram":
+		from meta_omnichannel.instagram.sync import sync_instagram_conversation_messages
+
+		# Defaults: limit=50, max_pages=MAX_MESSAGE_PAGES (bounded).
+		return sync_instagram_conversation_messages(conversation)
+	return {
+		"ok": False,
+		"error": f"{conv.provider} sync requires a confirmed connector API",
+		"pending_contract": True,
+	}
