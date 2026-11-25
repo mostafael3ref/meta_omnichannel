@@ -386,20 +386,13 @@ def publish_conversation_updated(
 ) -> None:
 	"""Permission-scoped realtime ping (per authorized user; never site-wide).
 
-	Payload is non-sensitive identifiers only. Failures never raise to the caller
-	so message sync success is preserved.
+	Payload is non-sensitive identifiers only. ``provider`` is taken from the
+	trusted Omnichannel Conversation document (not from the caller tip). Failures
+	never raise to the caller so message sync success is preserved.
 	"""
 	conversation = (conversation or "").strip()
 	if not conversation:
 		return
-
-	data = {
-		"conversation": conversation,
-		"provider": PROVIDER,
-		"source": source,
-	}
-	if processed is not None:
-		data["processed"] = int(processed)
 
 	try:
 		if not frappe.db.exists("Omnichannel Conversation", conversation):
@@ -413,6 +406,16 @@ def publish_conversation_updated(
 			conversation,
 		)
 		return
+
+	# Trusted channel label from Conversation — never invent from inbound tips.
+	provider = str(getattr(doc, "provider", None) or "").strip()
+	data = {
+		"conversation": conversation,
+		"provider": provider,
+		"source": source,
+	}
+	if processed is not None:
+		data["processed"] = int(processed)
 
 	for user in recipients:
 		try:

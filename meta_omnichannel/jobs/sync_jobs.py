@@ -55,11 +55,44 @@ def enqueue_conversation_message_sync(conversation: str):
 
 
 def run_conversation_message_sync(conversation: str) -> dict:
+	"""Facebook-only message sync + Real-Time publish. Do not route Instagram here."""
 	from meta_omnichannel.facebook_messenger.inbound import publish_conversation_updated
 	from meta_omnichannel.facebook_messenger.sync import sync_conversation_messages
 
 	result = sync_conversation_messages(conversation)
 	# Near-real-time Inbox refresh: non-sensitive identifiers only.
+	if result.get("ok"):
+		publish_conversation_updated(
+			conversation=conversation,
+			processed=result.get("processed"),
+			source="message_sync",
+		)
+	return result
+
+
+def enqueue_instagram_conversation_message_sync(conversation: str):
+	"""Enqueue Instagram per-conversation message sync (deduplicated)."""
+	return frappe.enqueue(
+		"meta_omnichannel.jobs.sync_jobs.run_instagram_conversation_message_sync",
+		queue="short",
+		timeout=300,
+		conversation=conversation,
+		job_id=f"omnichannel_ig_msg_sync:{conversation}",
+		deduplicate=True,
+	)
+
+
+def run_instagram_conversation_message_sync(conversation: str) -> dict:
+	"""Instagram message sync + Real-Time publish on success (shared publisher).
+
+	Uses the same permission-scoped ``publish_conversation_updated`` as Facebook.
+	Does **not** call Facebook ``sync_conversation_messages``. Failed syncs do not
+	publish.
+	"""
+	from meta_omnichannel.facebook_messenger.inbound import publish_conversation_updated
+	from meta_omnichannel.instagram.sync import sync_instagram_conversation_messages
+
+	result = sync_instagram_conversation_messages(conversation)
 	if result.get("ok"):
 		publish_conversation_updated(
 			conversation=conversation,

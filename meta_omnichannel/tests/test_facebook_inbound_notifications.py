@@ -554,11 +554,18 @@ class TestPermissionScopedRealtime(unittest.TestCase):
 		self.frappe.db.get_value.side_effect = _get_value
 		self.frappe.get_roles.side_effect = _get_roles
 
-	def _conv(self, *, name="CONV-1", assigned_to=None):
+	def _conv(self, *, name="CONV-1", assigned_to=None, provider="Facebook"):
 		doc = MagicMock()
 		doc.name = name
+		doc.provider = provider
 		doc.get = MagicMock(
-			side_effect=lambda key, default=None: assigned_to if key == "assigned_to" else default
+			side_effect=lambda key, default=None: (
+				assigned_to
+				if key == "assigned_to"
+				else provider
+				if key == "provider"
+				else default
+			)
 		)
 		# Also support attribute access used by some code paths
 		doc.assigned_to = assigned_to
@@ -639,6 +646,17 @@ class TestPermissionScopedRealtime(unittest.TestCase):
 			self.assertEqual(payload["provider"], "Facebook")
 			self.assertIn("source", payload)
 		return users
+
+	def test_provider_comes_from_conversation_document_not_hardcoded(self):
+		"""Backward-compatible Facebook label must come from Conversation.provider."""
+		self._conv(provider="Facebook")
+		self._set_role_holders({"Omnichannel Agent": ["agent@example.com"]})
+		self.enabled = {"agent@example.com": 1, "Administrator": 0}
+		self.roles = {"agent@example.com": ["Omnichannel Agent"]}
+		self.inbound.publish_conversation_updated(conversation="CONV-1", processed=1)
+		payload = self.frappe.publish_realtime.call_args.args[1]
+		self.assertEqual(payload["provider"], "Facebook")
+		self.assertEqual(payload["conversation"], "CONV-1")
 
 	def test_system_manager_receives_event(self):
 		self._conv(assigned_to="agent@example.com")
