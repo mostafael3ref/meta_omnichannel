@@ -15,6 +15,7 @@ jobs, remote media downloads, or outbound sends.
 from __future__ import annotations
 
 import hashlib
+import secrets
 from datetime import datetime
 from typing import Any
 
@@ -43,6 +44,18 @@ from meta_omnichannel.utils.threading_keys import instagram_thread_key
 PROVIDER = "Instagram"
 MAX_CONVERSATION_PAGES = 5
 MAX_MESSAGE_PAGES = 3
+# Bounded fan-out: after list sync, import messages for at most this many threads.
+DEFAULT_MAX_MESSAGE_CONVERSATIONS = 20
+INSTAGRAM_INBOX_SYNC_LOCK_KEY = "omnichannel:instagram_inbox_sync"
+INSTAGRAM_INBOX_SYNC_LOCK_TTL_SEC = 900  # 15 minutes; covers worst-case bounded run
+INSTAGRAM_FAIR_CURSOR_KEY = "omnichannel:instagram_message_sync_fair_cursor"
+# Lua: delete lock only when ownership token still matches.
+_RELEASE_LOCK_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+	return redis.call('del', KEYS[1])
+end
+return 0
+"""
 PREVIEW_MAX_LEN = 500
 # Omnichannel Message.external_message_id is Frappe Data (varchar 140).
 EXTERNAL_MESSAGE_ID_MAX_LEN = 140
@@ -781,3 +794,308 @@ def sync_instagram_conversations(*, limit: int = 50, max_pages: int = MAX_CONVER
 			"error": str(exc),
 			"sync_log": log_name,
 		}
+
+
+def _try_acquire_instagram_inbox_sync_lock() -> str | None:
+	"""Atomically acquire Instagram inbox sync lock. Returns ownership token, or None.
+
+	Uses Redis ``SET key token NX EX ttl`` via Frappe's RedisWrapper (``frappe.cache()``).
+	Fails **closed** on Redis errors (no concurrent run). Keys are Instagram-only —
+	never share Facebook lock keys.
+	"""
+	try:
+		cache = frappe.cache()
+		token = secrets.token_hex(16)
+		key = cache.make_key(INSTAGRAM_INBOX_SYNC_LOCK_KEY)
+		acquired = cache.set(key, token, nx=True, ex=INSTAGRAM_INBOX_SYNC_LOCK_TTL_SEC)
+		return token if acquired else None
+	except Exception:
+		get_logger().info("instagram_inbox_sync_lock_unavailable")
+		return None
+
+
+def _release_instagram_inbox_sync_lock(token: str | None) -> None:
+	"""Release lock only if ``token`` still owns it (never deletes another worker's lock)."""
+	if not token:
+		return
+	try:
+		cache = frappe.cache()
+		key = cache.make_key(INSTAGRAM_INBOX_SYNC_LOCK_KEY)
+		cache.eval(_RELEASE_LOCK_IF_OWNER, 1, key, token)
+	except Exception:
+		pass
+
+
+def _safe_message_sync_error(raw: Any) -> str:
+	"""Short, non-sensitive error text for API responses."""
+	text = str(raw or "").strip().split("\n")[0]
+	lower = text.lower()
+	for needle in ("authorization", "bearer", "api-key", "api_key", "x-api-key", "password", "secret"):
+		if needle in lower:
+			return "message sync failed"
+	return (text[:160] if text else "message sync failed")
+
+
+def _conversation_name(row: Any) -> str | None:
+	if row is None:
+		return None
+	if isinstance(row, dict):
+		return row.get("name")
+	return getattr(row, "name", None) or (row[0] if isinstance(row, (list, tuple)) and row else None)
+
+
+def _get_fair_sync_cursor() -> str:
+	try:
+		return str(frappe.cache().get_value(INSTAGRAM_FAIR_CURSOR_KEY) or "")
+	except Exception:
+		return ""
+
+
+def _set_fair_sync_cursor(name: str) -> None:
+	try:
+		# No TTL: survive between hourly runs until Redis flush.
+		frappe.cache().set_value(INSTAGRAM_FAIR_CURSOR_KEY, name)
+	except Exception:
+		pass
+
+
+def select_instagram_conversations_for_message_sync(
+	*, max_conversations: int = DEFAULT_MAX_MESSAGE_CONVERSATIONS
+) -> list[str]:
+	"""Choose Instagram threads for bounded message import (fair, non-starving).
+
+	Quota (of ``max_conversations``):
+
+	- ~50% recently active (``last_message_at`` desc) — includes newly bumped threads.
+	- ~25% empty / never-imported (capped; cannot consume the whole batch).
+	- remainder fair round-robin by ``name`` using a persisted Instagram-only cache cursor.
+
+	Filters ``provider=Instagram`` only (channel isolation from Facebook). Deduplicates
+	selected names. Does **not** treat preview text as proof a message is stored.
+	"""
+	limit = max(1, min(cint(max_conversations) or DEFAULT_MAX_MESSAGE_CONVERSATIONS, 100))
+	recent_quota = max(1, limit // 2)
+	empty_quota = max(1, limit // 4)
+	fair_quota = max(0, limit - recent_quota - empty_quota)
+
+	selected: list[str] = []
+	seen: set[str] = set()
+
+	def _take(names: list[str], quota: int) -> None:
+		for name in names:
+			if len(selected) >= limit:
+				return
+			if quota <= 0:
+				return
+			if name and name not in seen:
+				selected.append(name)
+				seen.add(name)
+				quota -= 1
+
+	recent = frappe.get_all(
+		"Omnichannel Conversation",
+		filters={"provider": PROVIDER, "is_archived": 0},
+		fields=["name"],
+		order_by="last_message_at desc, modified desc, name asc",
+		limit_page_length=recent_quota,
+	)
+	_take([_conversation_name(r) for r in (recent or [])], recent_quota)
+
+	empty_rows = frappe.db.sql(
+		"""
+		select c.name as name
+		from `tabOmnichannel Conversation` c
+		left join `tabOmnichannel Message` m on m.conversation = c.name
+		where c.provider = %s
+			and ifnull(c.is_archived, 0) = 0
+		group by c.name
+		having count(m.name) = 0
+		order by c.modified desc, c.name asc
+		limit %s
+		""",
+		(PROVIDER, empty_quota),
+		as_dict=True,
+	)
+	_take([_conversation_name(r) for r in (empty_rows or [])], empty_quota)
+
+	if fair_quota > 0 and len(selected) < limit:
+		all_names = [
+			_conversation_name(r)
+			for r in (
+				frappe.get_all(
+					"Omnichannel Conversation",
+					filters={"provider": PROVIDER, "is_archived": 0},
+					fields=["name"],
+					order_by="name asc",
+					limit_page_length=500,
+				)
+				or []
+			)
+		]
+		all_names = [n for n in all_names if n]
+		if all_names:
+			cursor = _get_fair_sync_cursor()
+			start = 0
+			if cursor in all_names:
+				start = (all_names.index(cursor) + 1) % len(all_names)
+			fair_picked: list[str] = []
+			for i in range(len(all_names)):
+				if len(fair_picked) >= fair_quota:
+					break
+				name = all_names[(start + i) % len(all_names)]
+				if name not in seen:
+					fair_picked.append(name)
+			if fair_picked:
+				_take(fair_picked, fair_quota)
+				_set_fair_sync_cursor(fair_picked[-1])
+
+	# If quotas left unused (e.g. few conversations), fill from recent remainder.
+	if len(selected) < limit:
+		more = frappe.get_all(
+			"Omnichannel Conversation",
+			filters={"provider": PROVIDER, "is_archived": 0},
+			fields=["name"],
+			order_by="last_message_at desc, modified desc, name asc",
+			limit_page_length=limit,
+		)
+		_take([_conversation_name(r) for r in (more or [])], limit - len(selected))
+
+	return selected[:limit]
+
+
+def sync_instagram_messages_for_conversations(
+	conversation_names: list[str],
+	*,
+	message_limit: int = 50,
+	max_message_pages: int = MAX_MESSAGE_PAGES,
+) -> dict[str, Any]:
+	"""Run ``sync_instagram_conversation_messages`` per name; isolate errors.
+
+	Deduplication of message rows remains inside
+	``upsert_instagram_message_from_connector`` (external id + payload hash).
+	"""
+	synced = 0
+	failed: list[dict[str, str]] = []
+	processed_messages = 0
+	for name in conversation_names:
+		try:
+			result = sync_instagram_conversation_messages(
+				name,
+				limit=message_limit,
+				max_pages=max_message_pages,
+			)
+			if result.get("ok"):
+				synced += 1
+				processed_messages += cint(result.get("processed") or 0)
+			else:
+				failed.append(
+					{
+						"conversation": name,
+						"error": _safe_message_sync_error(
+							result.get("error") or "message sync failed"
+						),
+					}
+				)
+		except Exception as exc:
+			failed.append({"conversation": name, "error": _safe_message_sync_error(exc)})
+			get_logger().info(
+				"instagram_message_sync_conversation_failed conversation=%s", name
+			)
+
+	return {
+		"ok": len(failed) == 0,
+		"selected": len(conversation_names),
+		"synced": synced,
+		"failed": failed,
+		"processed_messages": processed_messages,
+	}
+
+
+def sync_instagram_inbox_bounded(
+	*,
+	limit: int = 50,
+	max_conversation_pages: int = MAX_CONVERSATION_PAGES,
+	max_message_conversations: int = DEFAULT_MAX_MESSAGE_CONVERSATIONS,
+	message_limit: int = 50,
+	max_message_pages: int = MAX_MESSAGE_PAGES,
+) -> dict[str, Any]:
+	"""Coordinator: Instagram conversation list sync, then bounded per-thread messages.
+
+	Reuses ``sync_instagram_conversations`` and ``sync_instagram_conversation_messages``.
+	Overlapping runs are skipped via an Instagram-specific Redis NX lock (never the
+	Facebook lock). Caps message fan-out at ``max_message_conversations`` (default 20).
+	Does not publish Real-Time, enqueue webhooks, or send outbound messages.
+	"""
+	token = _try_acquire_instagram_inbox_sync_lock()
+	if not token:
+		get_logger().info("instagram_inbox_sync_skipped lock_held_or_unavailable")
+		return {
+			"ok": False,
+			"skipped": True,
+			"partial": False,
+			"processed": 0,
+			"error": "Instagram inbox sync already in progress",
+		}
+
+	try:
+		conversations = sync_instagram_conversations(
+			limit=limit, max_pages=max_conversation_pages
+		)
+		messages: dict[str, Any] = {
+			"ok": True,
+			"selected": 0,
+			"synced": 0,
+			"failed": [],
+			"processed_messages": 0,
+		}
+
+		# Even if the list sync fails, still attempt message sync for known threads.
+		selected = select_instagram_conversations_for_message_sync(
+			max_conversations=max_message_conversations
+		)
+		if selected:
+			messages = sync_instagram_messages_for_conversations(
+				selected,
+				message_limit=message_limit,
+				max_message_pages=max_message_pages,
+			)
+
+		list_ok = bool(conversations.get("ok"))
+		msg_failed = bool(messages.get("failed"))
+		msg_synced = cint(messages.get("synced") or 0)
+
+		if list_ok and not msg_failed:
+			ok = True
+			partial = False
+			error = None
+		elif list_ok and msg_failed:
+			ok = False
+			partial = True
+			n = len(messages.get("failed") or [])
+			error = f"Message sync failed for {n} conversation(s)"
+		elif (not list_ok) and msg_synced:
+			ok = False
+			partial = True
+			error = _safe_message_sync_error(
+				conversations.get("error") or "Instagram conversation list sync failed"
+			)
+		else:
+			ok = False
+			partial = False
+			error = _safe_message_sync_error(
+				conversations.get("error") or "Instagram sync failed"
+			)
+
+		return {
+			"ok": ok,
+			"partial": partial,
+			"skipped": False,
+			"processed": conversations.get("processed", 0),
+			"pages": conversations.get("pages"),
+			"sync_log": conversations.get("sync_log"),
+			"conversations": conversations,
+			"messages": messages,
+			"error": error,
+		}
+	finally:
+		_release_instagram_inbox_sync_lock(token)

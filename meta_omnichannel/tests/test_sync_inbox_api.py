@@ -102,25 +102,6 @@ class TestSyncInboxApi(unittest.TestCase):
 		self.assertIn("boom", result["error"])
 
 
-def _ensure_sync_module_stubs():
-	"""Install lightweight sync stubs so API tests can patch without loading Frappe deps."""
-	for pkg in (
-		"meta_omnichannel.facebook_messenger",
-		"meta_omnichannel.instagram",
-	):
-		if pkg not in sys.modules:
-			sys.modules[pkg] = types.ModuleType(pkg)
-
-	fb_sync = types.ModuleType("meta_omnichannel.facebook_messenger.sync")
-	fb_sync.sync_conversation_messages = MagicMock()  # type: ignore[attr-defined]
-	sys.modules["meta_omnichannel.facebook_messenger.sync"] = fb_sync
-
-	ig_sync = types.ModuleType("meta_omnichannel.instagram.sync")
-	ig_sync.sync_instagram_conversation_messages = MagicMock()  # type: ignore[attr-defined]
-	sys.modules["meta_omnichannel.instagram.sync"] = ig_sync
-	return fb_sync, ig_sync
-
-
 class TestSyncConversationApi(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -133,12 +114,27 @@ class TestSyncConversationApi(unittest.TestCase):
 		sys.modules["meta_omnichannel.permissions"] = perm
 		cls.perm = perm
 
-		cls.fb_sync_mod, cls.ig_sync_mod = _ensure_sync_module_stubs()
+		# Use real sync modules; mock only the per-conversation entrypoints so we
+		# do not replace package modules in sys.modules (avoids suite pollution).
+		import meta_omnichannel.facebook_messenger.sync as fb_sync
+		import meta_omnichannel.instagram.sync as ig_sync
+
+		cls.fb_sync_mod = fb_sync
+		cls.ig_sync_mod = ig_sync
+		cls._fb_sync_orig = fb_sync.sync_conversation_messages
+		cls._ig_sync_orig = ig_sync.sync_instagram_conversation_messages
+		fb_sync.sync_conversation_messages = MagicMock()
+		ig_sync.sync_instagram_conversation_messages = MagicMock()
 
 		import meta_omnichannel.api.inbox as inbox_mod
 
 		importlib.reload(inbox_mod)
 		cls.inbox = inbox_mod
+
+	@classmethod
+	def tearDownClass(cls):
+		cls.fb_sync_mod.sync_conversation_messages = cls._fb_sync_orig
+		cls.ig_sync_mod.sync_instagram_conversation_messages = cls._ig_sync_orig
 
 	def setUp(self):
 		self.perm.ensure_omnichannel_agent.reset_mock()

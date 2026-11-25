@@ -835,16 +835,16 @@ def sync_facebook_inbox(limit: int = 50) -> dict:
 
 @frappe.whitelist()
 def sync_instagram_inbox(limit: int = 50) -> dict:
-	"""Sync Instagram conversations from the connector (list only; Step 1).
+	"""Sync Instagram conversation list, then bounded recent/new message history.
 
 	If conversation items lack verified identity fields (``account_id``,
-	``sender_id``), the sync layer returns ``sync_blocked=True`` without
-	writing DocTypes.
+	``sender_id``), the list layer returns ``sync_blocked=True`` without
+	writing conversation DocTypes; known threads may still receive message sync.
 	"""
 	_ensure_can_trigger_connector_sync()
-	from meta_omnichannel.instagram.sync import sync_instagram_conversations
+	from meta_omnichannel.instagram.sync import sync_instagram_inbox_bounded
 
-	return sync_instagram_conversations(limit=cint(limit) or 50)
+	return sync_instagram_inbox_bounded(limit=cint(limit) or 50)
 
 
 def _run_channel_sync(label: str, runner) -> dict:
@@ -866,18 +866,18 @@ def _sync_facebook_conversations(limit: int) -> dict:
 
 
 def _sync_instagram_conversations(limit: int) -> dict:
-	from meta_omnichannel.instagram.sync import sync_instagram_conversations
+	"""Instagram channel runner for ``sync_inbox`` (list + bounded messages)."""
+	from meta_omnichannel.instagram.sync import sync_instagram_inbox_bounded
 
-	return sync_instagram_conversations(limit=limit)
+	return sync_instagram_inbox_bounded(limit=limit)
 
 
 @frappe.whitelist()
 def sync_inbox(limit: int = 50) -> dict:
-	"""Sync Facebook (conversations + bounded messages) and Instagram list independently.
+	"""Sync Facebook and Instagram independently (each: conversations + bounded messages).
 
 	One channel failing does not prevent the other from running. The Unified
 	Inbox Sync button should call this method (not Graph / browser keys).
-	Instagram remains list-only until message sync is enabled for that provider.
 	"""
 	_ensure_can_trigger_connector_sync()
 	limit = cint(limit) or 50
@@ -898,12 +898,16 @@ def sync_inbox(limit: int = 50) -> dict:
 		errors.append(instagram.get("error") or "Instagram sync failed")
 
 	# Channel isolation: Instagram still runs when Facebook is ok:false/partial.
-	# Top-level partial covers either cross-channel or Facebook messages_partial.
+	# Top-level partial covers cross-channel or either channel's messages_partial.
 	cross_channel_partial = (facebook_ok or instagram_ok) and not (facebook_ok and instagram_ok)
 	facebook_partial = bool(facebook.get("partial"))
+	instagram_partial = bool(instagram.get("partial"))
 	return {
 		"ok": facebook_ok and instagram_ok,
-		"partial": cross_channel_partial or (facebook_partial and instagram_ok),
+		"partial": cross_channel_partial
+		or (facebook_partial and instagram_ok)
+		or (instagram_partial and facebook_ok)
+		or (facebook_partial and instagram_partial),
 		"facebook": facebook,
 		"instagram": instagram,
 		"error": " · ".join(errors) if errors else None,
