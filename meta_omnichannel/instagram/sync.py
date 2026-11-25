@@ -14,6 +14,7 @@ jobs, remote media downloads, or outbound sends.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Any
 
@@ -43,6 +44,28 @@ PROVIDER = "Instagram"
 MAX_CONVERSATION_PAGES = 5
 MAX_MESSAGE_PAGES = 3
 PREVIEW_MAX_LEN = 500
+# Omnichannel Message.external_message_id is Frappe Data (varchar 140).
+EXTERNAL_MESSAGE_ID_MAX_LEN = 140
+_LONG_ID_PREFIX = "ig:"
+
+
+def normalize_instagram_external_message_id(raw_id: str) -> str:
+	"""Fit Instagram connector ``message_id`` into Data(140) without truncation.
+
+	- Empty → ``""`` (caller uses fingerprint dedup).
+	- Length ≤ 140 → unchanged (never re-hash an already-normalized ``ig:…`` value
+	  that is already ≤ 140).
+	- Length > 140 → ``ig:`` + SHA-256 hex of the **original** string (67 chars).
+
+	Call once before every dedup lookup and before persist. Never truncate.
+	"""
+	value = (raw_id or "").strip()
+	if not value:
+		return ""
+	if len(value) <= EXTERNAL_MESSAGE_ID_MAX_LEN:
+		return value
+	digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+	return f"{_LONG_ID_PREFIX}{digest}"
 
 
 def _ensure_instagram_channel(account_id: str) -> str:
@@ -271,7 +294,8 @@ def upsert_instagram_message_from_connector(
 	``timestamp``, ``message_id`` (``message_id`` / ``text`` may be null).
 
 	Dedup:
-	- ``external_message_id`` within the conversation
+	- ``external_message_id`` within the conversation (after
+	  ``normalize_instagram_external_message_id``)
 	- global unique ``external_message_id`` elsewhere (incl. other providers) —
 	  return existing name; never insert a second row or bump unread
 	- stable ``raw_payload_hash`` fingerprint when ``message_id`` is absent
@@ -297,12 +321,14 @@ def upsert_instagram_message_from_connector(
 
 	message_id_raw = row.get("message_id")
 	if message_id_raw is None:
-		external_id = ""
+		raw_external_id = ""
 	elif isinstance(message_id_raw, str):
-		external_id = message_id_raw.strip()
+		raw_external_id = message_id_raw.strip()
 	else:
 		# Malformed id type — fail closed (adapter should have rejected this).
 		return None
+	# Normalize once; use for all dedup lookups and the stored value.
+	external_id = normalize_instagram_external_message_id(raw_external_id)
 
 	text_raw = row.get("text")
 	if text_raw is None:
